@@ -840,7 +840,7 @@ app.get("/inbox", async (req, res) => {
     res.send(`
       <html><body style="font-family: sans-serif;">
         <h2>Inbox (${conversations.length})</h2>
-        <p style="color:#666;">🟢 Nova active &nbsp;&nbsp; 🟡 You're handling this one</p>
+        <p style="color:#666;">🟢 Nurse Hope active &nbsp;&nbsp; 🟡 You're handling this one</p>
         <table border="1" cellpadding="8" style="border-collapse: collapse;">
           <tr><th>Number</th><th>Last message</th><th>When</th><th>Reply window</th><th></th></tr>
           ${rows}
@@ -898,7 +898,7 @@ app.get("/inbox/chat", async (req, res) => {
                   <button type="submit" style="margin-left:10px;">Resume AI now</button>
                 </form>
               </div>`
-            : `<div style="background:#d1e7dd; padding:10px; border-radius:6px; margin-bottom:10px;">🟢 Nova is active on this chat</div>`
+            : `<div style="background:#d1e7dd; padding:10px; border-radius:6px; margin-bottom:10px;">🟢 Nurse Hope is active on this chat</div>`
         }
         <div style="border:1px solid #ddd; border-radius:8px; padding:16px; max-height:500px; overflow-y:auto;">
           ${bubbles || "<p>No messages yet.</p>"}
@@ -908,7 +908,7 @@ app.get("/inbox/chat", async (req, res) => {
             ? `<form method="POST" action="/inbox/reply" style="margin-top:16px;">
                 <input type="hidden" name="secret" value="${secret}">
                 <input type="hidden" name="sender" value="${sender}">
-                <textarea name="message" rows="3" style="width:100%; padding:8px;" placeholder="Type your reply... (this pauses Nova on this chat)" required></textarea>
+                <textarea name="message" rows="3" style="width:100%; padding:8px;" placeholder="Type your reply... (this pauses Nurse Hope on this chat)" required></textarea>
                 <button type="submit" style="margin-top:8px; padding:10px 20px;">Send</button>
               </form>`
             : `<p style="color:#999; margin-top:16px;">Reply window closed (24h+ since their last message) — use <a href="/send-message">Send Message</a> with an approved template instead.</p>`
@@ -940,7 +940,7 @@ app.post("/inbox/reply", express.urlencoded({ extended: true }), async (req, res
     const sent = await sendWhatsAppMessage(sender, message, phoneNumberId);
 
     // Pause the AI regardless of send success — you tried to take over this
-    // conversation, so Nova should stay quiet either way. If the send
+    // conversation, so Nurse Hope should stay quiet either way. If the send
     // failed, you'll see that below and can retry, but the pause still holds.
     const history = convo?.history || [];
     history.push({ role: "model", parts: [{ text: sent ? message : `[SEND FAILED — attempted]: ${message}` }] });
@@ -955,7 +955,7 @@ app.post("/inbox/reply", express.urlencoded({ extended: true }), async (req, res
 
     if (!sent) {
       return res.send(
-        `⚠️ The message may not have delivered (check Render logs for the exact error), but Nova is paused on this chat regardless — you can retry sending. <br><a href="/inbox/chat?sender=${encodeURIComponent(sender)}&secret=${secret}">Back to chat</a>`
+        `⚠️ The message may not have delivered (check Render logs for the exact error), but Nurse Hope is paused on this chat regardless — you can retry sending. <br><a href="/inbox/chat?sender=${encodeURIComponent(sender)}&secret=${secret}">Back to chat</a>`
       );
     }
 
@@ -1025,7 +1025,7 @@ app.get("/leads", async (req, res) => {
 
 // ====== JSON API — call this from your Lovable dashboard to send a broadcast ======
 // ====== JSON API — send a single message to one customer from your dashboard ======
-// ====== JSON API — send a free-text reply from your Lovable chat UI, pauses Nova on that chat ======
+// ====== JSON API — send a free-text reply from your Lovable chat UI, pauses Nurse Hope on that chat ======
 app.post("/api/inbox-reply", async (req, res) => {
   const { secret, sender, message } = req.body;
 
@@ -1068,7 +1068,7 @@ app.post("/api/inbox-reply", async (req, res) => {
   }
 });
 
-// ====== JSON API — resume Nova on a paused conversation, from Lovable ======
+// ====== JSON API — resume Nurse Hope on a paused conversation, from Lovable ======
 app.post("/api/inbox-resume", async (req, res) => {
   const { secret, sender } = req.body;
 
@@ -1432,7 +1432,7 @@ async function handleWhatsApp(body) {
   // can itself be looked up later if the customer quotes it in a future message
   if (text) messageStore.set(message.id, { text, time: Date.now() });
 
-  // If they replied/quoted an earlier message — whether it was Nova's or
+  // If they replied/quoted an earlier message — whether it was Nurse Hope's or
   // their own — tell the AI exactly what was quoted
   if (message.context?.id) {
     const quoted = messageStore.get(message.context.id);
@@ -1445,7 +1445,7 @@ async function handleWhatsApp(body) {
   await markAsReadAndTyping(message.id, receivingPhoneNumberId);
 
   // If a human is actively handling this conversation, record the message
-  // so it shows in the inbox, but don't let Nova auto-reply on top of them
+  // so it shows in the inbox, but don't let Nurse Hope auto-reply on top of them
   const convo = await getConversation(from);
   if (convo.humanPausedUntil && convo.humanPausedUntil > Date.now()) {
     console.log(`AI paused on ${from} (human handling) — recording message only`);
