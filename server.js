@@ -1713,3 +1713,120 @@ async function sendWhatsAppMessage(to, text, phoneNumberId = PHONE_NUMBER_ID) {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+const axios = require('axios');
+
+const GRAPH_API_URL = `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
+const AUTH_HEADER = {
+  headers: {
+    Authorization: `Bearer ${process.env.PERMANENT_TOKEN}`,
+    'Content-Type': 'application/json'
+  }
+};
+
+/**
+ * Sends a rich interactive booking banner with logo and action buttons
+ */
+async function sendBookingInvitation(to) {
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      header: {
+        type: "image",
+        image: {
+          // Direct public URL to Triple H clinic logo or banner
+          link: "https://triplehfertilityhub.com/favicon.png"
+        }
+      },
+      body: {
+        text: 
+          "*Triple H Fertility Hub & Specialist Hospital*\n" +
+          "_Care, Compassion & Clinical Excellence_\n\n" +
+          "To book your consultation with *Dr. Haleemah Olalere* and our fertility team:\n\n" +
+          "📋 *Registration/Card:* ₦10,000\n" +
+          "🩺 *Consultation:* ₦70,000\n" +
+          "🕒 *Hours:* Mon–Thu 9am–6pm | Sat 10am–4pm\n" +
+          "📍 *Location:* No. 5 Onitolo Street, Gbaja, Surulere"
+      },
+      footer: {
+        text: "Select an option below to proceed"
+      },
+      action: {
+        buttons: [
+          {
+            type: "reply",
+            reply: {
+              id: "btn_book_chat",
+              title: "Book Here in Chat 📝"
+            }
+          },
+          {
+            type: "reply",
+            reply: {
+              id: "btn_book_online",
+              title: "Open Booking Form 🌐"
+            }
+          }
+        ]
+      }
+    }
+  };
+
+  try {
+    await axios.post(GRAPH_API_URL, payload, AUTH_HEADER);
+  } catch (error) {
+    console.error("Error sending booking invitation:", error.response?.data || error.message);
+  }
+}
+async function sendFormLink(to) {
+  const textPayload = {
+    messaging_product: "whatsapp",
+    to: to,
+    type: "text",
+    text: {
+      preview_url: true,
+      body: "Please complete your booking details directly on our mobile portal:\n👉 https://triplehfertilityhub.com/book\n\nOnce completed, our coordinator will receive your details immediately!"
+    }
+  };
+  await axios.post(GRAPH_API_URL, textPayload, AUTH_HEADER);
+}
+async function sendServicePicker(to) {
+  const payload = {
+    messaging_product: "whatsapp",
+    to: to,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      header: {
+        type: "text",
+        text: "Select a Consultation Service"
+      },
+      body: {
+        text: "Choose the service you wish to schedule an appointment for:"
+      },
+      footer: {
+        text: "Triple H Care Services"
+      },
+      action: {
+        button: "Choose Service",
+        sections: [
+          {
+            title: "Consultations",
+            rows: [
+              { id: "svc_ivf", title: "IVF & Fertility Care", description: "Comprehensive reproductive assessment" },
+              { id: "svc_gynae", title: "Gynaecology Care", description: "Fibroids, PCOS, pelvic health" },
+              { id: "svc_telemedicine", title: "Telemedicine (Online)", description: "Virtual consultation via video/call" },
+              { id: "svc_scan", title: "Pelvic Ultrasound Scan", description: "Follicular tracking & pelvic imaging" }
+            ]
+          }
+        ]
+      }
+    }
+  };
+  await axios.post(GRAPH_API_URL, payload, AUTH_HEADER);
+}
+
