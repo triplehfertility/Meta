@@ -29,6 +29,15 @@ const CRM_SECRET = process.env.CRM_SECRET || "PASTE_A_PASSWORD_HERE"; // for vie
 
 // ====== ALERT YOU WHEN A HUMAN NEEDS TO STEP IN ======
 const OWNER_WHATSAPP_NUMBER = process.env.OWNER_WHATSAPP_NUMBER || "2348143594483";
+// Store active conversation timers for each patient (e.g., 5-minute inactivity trigger)
+const conversationTimers = new Map();
+
+// Two owner WhatsApp numbers in international format (no '+' or leading '0', e.g., '2348034043725')
+const OWNER_PHONE_NUMBERS = [
+  "234XXXXXXXXXX", // Owner 1
+  "234YYYYYYYYYY", // Owner 2
+];
+
 const BASE_URL = process.env.BASE_URL || "https://meta-n4tt.onrender.com";
 // If any of your approved templates have an IMAGE header, put a public image
 // URL here (e.g. your logo on your website). Leave as-is if none need one.
