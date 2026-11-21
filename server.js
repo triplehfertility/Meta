@@ -172,6 +172,61 @@ async function refreshWebsiteContent() {
 // Fetch once on startup, then refresh every 6 hours
 refreshWebsiteContent();
 setInterval(refreshWebsiteContent, 6 * 60 * 60 * 1000);
+/**
+ * Sends the approved Meta template to the clinic owners
+ */
+async function sendPatientSummaryToOwners(summaryData) {
+  const { name, phone, service, status, notes } = summaryData;
+  const phoneNumberId = process.env.WABA_PHONE_NUMBER_ID || process.env.PHONE_NUMBER_ID;
+  const token = process.env.PERMANENT_META_TOKEN || process.env.WHATSAPP_TOKEN;
+
+  if (!phoneNumberId || !token) {
+    console.error("Missing WABA_PHONE_NUMBER_ID or PERMANENT_META_TOKEN");
+    return;
+  }
+
+  for (const ownerPhone of OWNER_PHONE_NUMBERS) {
+    try {
+      const payload = {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: ownerPhone,
+        type: "template",
+        template: {
+          name: "patient_chat_summary",
+          language: { code: "en" },
+          components: [
+            {
+              type: "body",
+              parameters: [
+                { type: "text", text: name || "Prospective Patient" },
+                { type: "text", text: phone || "Not provided" },
+                { type: "text", text: service || "General Fertility Inquiry" },
+                { type: "text", text: status || "Inquiry / Needs Follow-up" },
+                { type: "text", text: notes || "Chat ended without explicit booking." }
+              ]
+            }
+          ]
+        }
+      };
+
+      const response = await axios.post(
+        `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json"
+          }
+        }
+      );
+
+      console.log(`Summary template sent to owner ${ownerPhone}:`, response.data);
+    } catch (err) {
+      console.error(`Failed to send summary template to ${ownerPhone}:`, err.response?.data || err.message);
+    }
+  }
+}
 
 // ====== YOUR BUSINESS INFO GOES HERE ======
 // This is what the AI uses to answer questions. Edit this freely.
@@ -1385,6 +1440,74 @@ app.post("/webhook", async (req, res) => {
   } catch (err) {
     console.error("Error handling incoming message:", err);
   }
+
+  // Inside your incoming WhatsApp message handler, right after receiving a message from `senderId`:
+
+// Clear any existing timer for this patient
+if (conversationTimers.has(senderId)) {
+  clearTimeout(conversationTimers.get(senderId));
+}
+
+// Start a new 5-minute inactivity countdown (300,000 ms)
+const timer = setTimeout(async () => {
+  conversationTimers.delete(senderId);
+
+  try {
+    console.log(`Patient ${senderId} inactive for 5 minutes. Generating summary...`);
+    
+    // Retrieve conversation history for this sender
+    const history = getConversationHistory(senderId); // your existing history lookup
+    
+    if (!history || history.length < 2) return; // Don't alert on empty or single-message chats
+
+    // Generate quick summary using your OpenAI / LLM call
+    const summaryCompletion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You are an assistant summarizing a clinical fertility chat for clinic managers.
+Return a valid JSON object only with these exact keys:
+{
+  "name": "patient's name or Prospective Patient",
+  "service": "primary topic or service discussed",
+  "status": "Inquiry / Asked Fees / Wants Appointment / Booked",
+  "notes": "2-sentence summary of what was discussed and what follow-up is needed"
+}`
+        },
+        {
+          role: "user",
+          content: `Conversation:\n${history.map(m => `${m.role}: ${m.content}`).join("\n")}`
+        }
+      ],
+      response_format: { type: "json_object" }
+    });
+
+    const parsed = JSON.parse(summaryCompletion.choices[0].message.content);
+
+    // 1. Send template alert to owners on WhatsApp
+    await sendPatientSummaryToOwners({
+      name: parsed.name,
+      phone: senderId,
+      service: parsed.service,
+      status: parsed.status,
+      notes: parsed.notes
+    });
+
+    // 2. Also log to your Google Sheet webhook
+    await saveLead("WhatsApp Chat", senderId, {
+      fullName: parsed.name,
+      phone: senderId,
+      service: parsed.service,
+      notes: parsed.notes
+    });
+
+  } catch (err) {
+    console.error("Error in inactivity summary task:", err);
+  }
+}, 5 * 60 * 1000); // 5 minutes
+
+conversationTimers.set(senderId, timer);
 });
 
 // ====== Download an image/audio file WhatsApp sent us ======
