@@ -437,20 +437,6 @@ async function processAIReply(aiReply, platform, senderId, userMessage, phoneNum
   let cleanReply = aiReply;
   let shouldBookCall = false;
 
-    const saveLeadMatch = cleanReply.match(/\[SAVE_LEAD:(\{.*?\})\]/);
-  if (saveLeadMatch) {
-    try {
-      const leadData = JSON.parse(saveLeadMatch[1]);
-      if (platform === "WhatsApp" && !leadData.phone) {
-        leadData.phone = senderId;
-      }
-      await saveLead(platform, senderId, leadData);
-    } catch (err) {
-      console.error("Failed to parse SAVE_LEAD tag:", err);
-    }
-    cleanReply = cleanReply.replace(saveLeadMatch[0], "").trim();
-  }
-
   const saveLeadMatch = cleanReply.match(/\[SAVE_LEAD:(\{.*?\})\]/);
   if (saveLeadMatch) {
     try {
