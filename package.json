@@ -1,14 +1,17 @@
 {
-  "name": "whatsapp-ai-bot",
-  "version": "1.0.0",
-  "description": "Test backend: WhatsApp Cloud API + Gemini AI auto-responder",
+  "name": "triple-h-messaging-assistant",
+  "version": "2.0.0",
+  "description": "WhatsApp, Messenger and Instagram assistant (Nurse Hope) with an in-chat booking form for Triple H Fertility Hub",
   "main": "server.js",
+  "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "flow-json": "node server.js --flow-json"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5",
-    "pdfkit": "^0.15.0"
+    "express": "^4.21.0"
   }
 }
