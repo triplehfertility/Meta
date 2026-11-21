@@ -1,8 +1,7 @@
 // Triple H Fertility Hub - Messaging Assistant ("Nurse Hope")
 // WhatsApp, Facebook Messenger and Instagram -> this server -> Gemini -> reply.
-// When a patient wants to book, the chat shows an interactive form:
-//   - WhatsApp: a WhatsApp Flow (form opens inside the chat)
-//   - Messenger / Instagram: a button that opens a secure web form
+// When a patient wants to book, the chat shows a "Book appointment" button that opens
+// the interactive booking form hosted by this server (same form on all three channels).
 // No database. Chats live in memory; bookings go to staff by WhatsApp and (optionally) to Google Sheets.
 
 "use strict";
@@ -12,14 +11,10 @@ const crypto = require("crypto");
 const env = process.env;
 
 // =====================================================================================
-// 1. THE BOOKING FORM: options, WhatsApp Flow JSON, and cleanup of what patients submit.
-//    The WhatsApp Flow, the Messenger/Instagram web form and the staff alerts all use
-//    these same lists, so they can never drift apart.
-//    Print the Flow JSON to paste into WhatsApp Manager:  node server.js --flow-json
+// 1. THE BOOKING FORM: the options on the form, and cleanup of what patients submit.
+//    The web form and the staff alerts use these same lists, so they never drift apart.
+//    To change services, days or times, edit the lists below.
 // =====================================================================================
-const FLOW_SCREEN_ID = "BOOKING"; // the first (and only) screen of the Flow
-
-// Dropdown/radio option titles must be 30 characters or fewer (WhatsApp rule).
 const SERVICES = [
   { id: "fertility_assessment", title: "Fertility Assessment" },
   { id: "ivf_iui_icsi", title: "IVF, IUI & ICSI" },
@@ -56,68 +51,7 @@ const TIMES = [
   { id: "any", title: "Any time" },
 ];
 
-const FIELDS = ["name", "phone", "email", "service", "mode", "day", "time", "notes", "consent"];
-
-function buildFlowJson() {
-  return {
-    version: "7.3",
-    screens: [
-      {
-        id: FLOW_SCREEN_ID,
-        title: "Book a Consultation",
-        terminal: true,
-        success: true,
-        layout: {
-          type: "SingleColumnLayout",
-          children: [
-            { type: "TextHeading", text: "Triple H Fertility Hub" },
-            {
-              type: "TextBody",
-              text: "Tell us what you need and our team will confirm your appointment time. Clinic hours: Mon-Thu 9am-6pm, Sat 10am-4pm.",
-            },
-            {
-              type: "Form",
-              name: "form",
-              children: [
-                { type: "TextInput", name: "name", label: "Full name", "input-type": "text", required: true },
-                { type: "TextInput", name: "phone", label: "Phone / WhatsApp", "input-type": "phone", required: true },
-                { type: "TextInput", name: "email", label: "Email (optional)", "input-type": "email", required: false },
-                { type: "Dropdown", name: "service", label: "Service", required: true, "data-source": SERVICES },
-                { type: "RadioButtonsGroup", name: "mode", label: "Consultation type", required: true, "data-source": MODES },
-                { type: "Dropdown", name: "day", label: "Preferred day", required: true, "data-source": DAYS },
-                { type: "Dropdown", name: "time", label: "Preferred time", required: true, "data-source": TIMES },
-                {
-                  type: "TextArea",
-                  name: "notes",
-                  label: "Anything to add?",
-                  required: false,
-                  "max-length": 300,
-                  "helper-text": "Please do not share medical records here.",
-                },
-                {
-                  type: "OptIn",
-                  name: "consent",
-                  label: "I agree that Triple H Fertility Hub may contact me about this request.",
-                  required: true,
-                },
-              ],
-            },
-            {
-              type: "Footer",
-              label: "Request appointment",
-              "on-click-action": {
-                name: "complete",
-                payload: Object.fromEntries(FIELDS.map((f) => [f, "${form." + f + "}"])),
-              },
-            },
-          ],
-        },
-      },
-    ],
-  };
-}
-
-// ---- Cleaning up what a customer submitted (Flow or web form) ----
+// ---- Cleaning up what a customer submitted ----
 const clip = (v, max) => String(v ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, max);
 const labelOf = (list, id) => (list.find((x) => x.id === id) || { title: clip(id, 60) }).title;
 
@@ -133,11 +67,6 @@ function normalizeSubmission(raw = {}) {
     notes: clip(raw.notes, 300),
     consent: raw.consent === true || raw.consent === "true" || raw.consent === "on",
   };
-}
-
-if (process.argv.includes("--flow-json")) {
-  console.log(JSON.stringify(buildFlowJson(), null, 2));
-  process.exit(0);
 }
 
 const express = require("express");
@@ -160,8 +89,6 @@ const GRAPH_IG = `https://graph.instagram.com/${GRAPH_VERSION}`;
 // WhatsApp
 const WHATSAPP_TOKEN = env.WHATSAPP_TOKEN || "";
 const PHONE_NUMBER_ID = env.PHONE_NUMBER_ID || "";
-const BOOKING_FLOW_ID = env.BOOKING_FLOW_ID || ""; // from WhatsApp Manager after you publish the Flow
-const FLOW_MODE = env.FLOW_MODE === "draft" ? "draft" : "published"; // "draft" lets you test an unpublished Flow
 const STAFF_WHATSAPP_NUMBER = (env.STAFF_WHATSAPP_NUMBER || "").replace(/\D/g, ""); // alerts go here, e.g. 2348034043725
 // Messenger + Instagram
 const PAGE_ACCESS_TOKEN = env.PAGE_ACCESS_TOKEN || "";
@@ -182,7 +109,6 @@ const AI_LIMIT_PER_HOUR = Number(env.AI_LIMIT_PER_HOUR || 40); // per person, st
 const MEDIA_TO_AI = env.MEDIA_TO_AI !== "false"; // set to "false" to stop sending voice notes/images to Gemini
 const MAX_MEDIA_BYTES = 8 * 1024 * 1024;
 const BLOCKED_NUMBERS = (env.BLOCKED_NUMBERS || "").split(",").map((s) => s.trim()).filter(Boolean);
-const BOOKING_PAGE_URL = env.BOOKING_PAGE_URL || "https://triplehfertilityhub.com/book";
 const MEDESK_URL = "https://app.medesk.net/patient/?e=654e537f7c6e2b0706f9c9c0&a=anonymous";
 // Google Sheets (optional)
 const SHEET_ID = env.GOOGLE_SHEET_ID || "";
@@ -674,44 +600,29 @@ async function notifyStaff(text) {
 // =====================================================================================
 // 9. SENDING THE BOOKING FORM TO THE PATIENT
 // =====================================================================================
-const FLOW_BODY =
+const BOOKING_INTRO =
   "Tap the button below to open our quick booking form. Our team will confirm your exact appointment time.\n\n" +
   `Initial visit: ${FEES.total} (${FEES.registration} card + ${FEES.consultation} consultation)\n` +
-  "Hours: Mon-Thu 9am-6pm, Sat 10am-4pm\n\n" +
-  `Prefer the website? ${BOOKING_PAGE_URL}`;
+  "Hours: Mon-Thu 9am-6pm, Sat 10am-4pm";
 
-// WhatsApp: the form opens inside the chat
-async function sendBookingFlow(to, phoneNumberId = PHONE_NUMBER_ID) {
-  if (!BOOKING_FLOW_ID) return false;
+// WhatsApp: a message with a "Book appointment" button that opens the web form
+async function sendBookingButtonWhatsApp(to, phoneNumberId = PHONE_NUMBER_ID) {
+  const url = formUrl("WhatsApp", to);
   const { ok } = await waPost(phoneNumberId, {
     recipient_type: "individual",
     ...waTarget(to),
     type: "interactive",
     interactive: {
-      type: "flow",
+      type: "cta_url",
       header: { type: "text", text: "Book a Consultation" },
-      body: { text: FLOW_BODY },
+      body: { text: BOOKING_INTRO },
       footer: { text: "Triple H Fertility Hub" },
-      action: {
-        name: "flow",
-        parameters: {
-          flow_message_version: "3",
-          flow_id: BOOKING_FLOW_ID,
-          flow_token: `booking_${Date.now()}`,
-          flow_cta: "Book appointment",
-          mode: FLOW_MODE,
-          flow_action: "navigate",
-          flow_action_payload: { screen: FLOW_SCREEN_ID },
-        },
-      },
+      action: { name: "cta_url", parameters: { display_text: "Book appointment", url } },
     },
   });
-  return ok;
-}
-
-// Plain link, used when the Flow is not set up yet or fails (older WhatsApp versions cannot open Flows)
-async function sendBookingLinkWhatsApp(to, phoneNumberId) {
-  return sendWhatsAppText(to, `Please complete your booking details on our secure page:\n${BOOKING_PAGE_URL}\n\nOur team will receive your request straight away.`, phoneNumberId);
+  if (ok) return true;
+  // Fallback: a plain text link always works
+  return sendWhatsAppText(to, `${BOOKING_INTRO}\n\n${url}`, phoneNumberId);
 }
 
 // Messenger / Instagram: a button that opens our web form
@@ -746,15 +657,11 @@ async function sendBookingButton(platform, to) {
 }
 
 async function sendBookingForm(platform, senderId, phoneNumberId) {
-  if (platform === "WhatsApp") {
-    if (await sendBookingFlow(senderId, phoneNumberId)) return;
-    await sendBookingLinkWhatsApp(senderId, phoneNumberId);
-  } else {
-    await sendBookingButton(platform, senderId);
-  }
+  if (platform === "WhatsApp") await sendBookingButtonWhatsApp(senderId, phoneNumberId);
+  else await sendBookingButton(platform, senderId);
 }
 
-// A submitted form (from the WhatsApp Flow or the web form) ends up here
+// A submitted booking form ends up here
 async function recordBooking(platform, senderId, rawForm, phoneNumberId) {
   const form = normalizeSubmission(rawForm);
   if (platform === "WhatsApp" && !form.phone && /^\d{5,16}$/.test(senderId)) form.phone = senderId;
@@ -942,18 +849,6 @@ async function handleWhatsApp(body) {
         const senderId = m.from || m.from_user_id;
         if (!senderId) continue;
 
-        // The patient submitted the in-chat booking form (WhatsApp Flow)
-        if (m.type === "interactive" && m.interactive?.type === "nfm_reply") {
-          if (alreadySeen(m.id)) continue;
-          let data = {};
-          try { data = JSON.parse(m.interactive.nfm_reply.response_json || "{}"); } catch (err) { console.error("Bad Flow response:", err.message); }
-          console.log(`Booking form submitted by ${senderId}`);
-          const convo = getConversation(senderId);
-          convo.lastCustomerTime = Date.now();
-          await recordBooking("WhatsApp", senderId, data, phoneNumberId);
-          continue;
-        }
-
         let text = null;
         let media = null;
         try {
@@ -1108,7 +1003,7 @@ ${error ? `<div class="err">${esc(error)}</div>` : ""}
 </form></div></body></html>`;
 }
 
-const WEB_FORM_PLATFORMS = ["Messenger", "Instagram"];
+const WEB_FORM_PLATFORMS = ["WhatsApp", "Messenger", "Instagram"];
 
 app.get("/book-session", (req, res) => {
   const { p, s, t } = req.query;
@@ -1116,7 +1011,9 @@ app.get("/book-session", (req, res) => {
   if (!WEB_FORM_PLATFORMS.includes(p) || !validLink(p, String(s || ""), String(t || ""))) {
     return res.status(403).send("This booking link is not valid. Please message us again to get a new one.");
   }
-  res.send(bookingPage({ platform: p, sender: String(s), token: String(t) }));
+  // On WhatsApp we already know the number, so pre-fill it
+  const v = p === "WhatsApp" && /^\d{5,16}$/.test(String(s)) ? { phone: String(s) } : {};
+  res.send(bookingPage({ platform: p, sender: String(s), token: String(t), v }));
 });
 
 app.post("/book-session", async (req, res) => {
@@ -1252,11 +1149,6 @@ app.post("/leads/contacted", adminAuth, sameOrigin, (req, res) => {
   const lead = leads.find((l) => l.id === Number(req.body.id));
   if (lead) lead.status = "contacted";
   res.redirect("/leads");
-});
-
-// Download the booking form definition to paste into WhatsApp Manager (always matches this server's options)
-app.get("/flow-json", adminAuth, (req, res) => {
-  res.type("application/json").send(JSON.stringify(buildFlowJson(), null, 2));
 });
 
 // =====================================================================================
