@@ -1,306 +1,183 @@
-// Triple H Fertility Hub - Messaging Assistant ("Nurse Hope")
-// WhatsApp, Facebook Messenger and Instagram -> this server -> Gemini -> reply.
-// When a patient wants to book, the chat shows a "Book appointment" button that opens
-// the interactive booking form hosted by this server (same form on all three channels).
-// No database. Chats live in memory; bookings go to staff by WhatsApp and (optionally) to Google Sheets.
-
-"use strict";
-
-const crypto = require("crypto");
-
-const env = process.env;
-
-// =====================================================================================
-// 1. THE BOOKING FORM: the options on the form, and cleanup of what patients submit.
-//    The web form and the staff alerts use these same lists, so they never drift apart.
-//    To change services, days or times, edit the lists below.
-// =====================================================================================
-const SERVICES = [
-  { id: "fertility_assessment", title: "Fertility Assessment" },
-  { id: "ivf_iui_icsi", title: "IVF, IUI & ICSI" },
-  { id: "male_fertility", title: "Male Fertility / Semen Test" },
-  { id: "hsg_scan", title: "HSG & Pelvic Ultrasound" },
-  { id: "fertility_preservation", title: "Egg / Sperm Freezing" },
-  { id: "gynae_surgery", title: "Gynae Surgery (Fibroids etc)" },
-  { id: "antenatal", title: "Antenatal Care" },
-  { id: "premarital", title: "Premarital Screening" },
-  { id: "genotype_pgt", title: "Sickle Cell Screening (PGT)" },
-  { id: "counselling", title: "Counselling & Psychology" },
-  { id: "not_sure", title: "Not sure yet" },
-];
-
-const MODES = [
-  { id: "in_person", title: "In person (Surulere)" },
-  { id: "telemedicine", title: "Telemedicine (online)" },
-];
-
-// The clinic is closed on Friday and Sunday, so those days are simply not offered.
-const DAYS = [
-  { id: "mon", title: "Monday" },
-  { id: "tue", title: "Tuesday" },
-  { id: "wed", title: "Wednesday" },
-  { id: "thu", title: "Thursday" },
-  { id: "sat", title: "Saturday" },
-  { id: "any", title: "Any available day" },
-];
-
-const TIMES = [
-  { id: "morning", title: "Morning (9am - 12pm)" },
-  { id: "afternoon", title: "Afternoon (12pm - 4pm)" },
-  { id: "late", title: "Late (4pm - 6pm, Mon-Thu)" },
-  { id: "any", title: "Any time" },
-];
-
-// ---- Cleaning up what a customer submitted ----
-const clip = (v, max) => String(v ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, max);
-const labelOf = (list, id) => (list.find((x) => x.id === id) || { title: clip(id, 60) }).title;
-
-function normalizeSubmission(raw = {}) {
-  return {
-    name: clip(raw.name, 80),
-    phone: clip(raw.phone, 30),
-    email: clip(raw.email, 100),
-    service: raw.service ? labelOf(SERVICES, raw.service) : "",
-    mode: raw.mode ? labelOf(MODES, raw.mode) : "",
-    day: raw.day ? labelOf(DAYS, raw.day) : "",
-    time: raw.time ? labelOf(TIMES, raw.time) : "",
-    notes: clip(raw.notes, 300),
-    consent: raw.consent === true || raw.consent === "true" || raw.consent === "on",
-  };
-}
+// WhatsApp AI Auto-Responder - Test Backend
+// Flow: WhatsApp message -> this server -> Gemini API -> reply sent back via WhatsApp
 
 const express = require("express");
+const cors = require("cors");
+const PDFDocument = require("pdfkit");
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-// =====================================================================================
-// 2. SETTINGS (set these in Render > Environment. Never put real keys in this file.)
-// =====================================================================================
-const REQUIRED = ["VERIFY_TOKEN", "APP_SECRET", "GEMINI_API_KEY", "ADMIN_PASSWORD"];
-const missing = REQUIRED.filter((k) => !env[k]);
-if (missing.length) {
-  console.error("Missing required environment variables:", missing.join(", "));
-  process.exit(1);
-}
+// ====== FILL THESE IN (.env or directly here for quick testing) ======
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "my_test_verify_token_123"; // you make this up, used in Step 2 webhook setup
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN || "PASTE_YOUR_META_ACCESS_TOKEN_HERE";
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || "PASTE_YOUR_PHONE_NUMBER_ID_HERE";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "PASTE_YOUR_GEMINI_API_KEY_HERE";
 
-const BASE_URL = (env.BASE_URL || "https://meta-n4tt.onrender.com").replace(/\/+$/, "");
-const GRAPH_VERSION = env.GRAPH_VERSION || "v23.0";
-const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
-const GRAPH_IG = `https://graph.instagram.com/${GRAPH_VERSION}`;
+// ====== BROADCAST PANEL ======
+// A password you make up, used to access the /broadcast-panel page
+const BROADCAST_SECRET = process.env.BROADCAST_SECRET || "PASTE_A_PASSWORD_HERE";
 
-// WhatsApp
-const WHATSAPP_TOKEN = env.WHATSAPP_TOKEN || "";
-const PHONE_NUMBER_ID = env.PHONE_NUMBER_ID || "";
-const STAFF_WHATSAPP_NUMBER = (env.STAFF_WHATSAPP_NUMBER || "").replace(/\D/g, ""); // alerts go here, e.g. 2348034043725
-// Messenger + Instagram
-const PAGE_ACCESS_TOKEN = env.PAGE_ACCESS_TOKEN || "";
-const IG_ACCESS_TOKEN = env.IG_ACCESS_TOKEN || "";
-const IG_ACCOUNT_ID = env.IG_ACCOUNT_ID || "";
-const META_APP_ID = env.META_APP_ID || ""; // optional: lets the bot tell staff replies from its own in Messenger/Instagram
-// AI
-const GEMINI_API_KEY = env.GEMINI_API_KEY;
-const GEMINI_MODEL = env.GEMINI_MODEL || "gemini-3.5-flash-lite";
-// Staff pages
-const ADMIN_USER = env.ADMIN_USER || "admin";
-// Behaviour
-const SESSION_TIMEOUT_MS = Number(env.SESSION_TIMEOUT_HOURS || 48) * 3600 * 1000;
-const HUMAN_PAUSE_MS = Number(env.HUMAN_PAUSE_HOURS || 2) * 3600 * 1000;
-const DEBOUNCE_MS = Number(env.DEBOUNCE_MS || 6000); // wait for the patient to finish typing
-const MAX_HISTORY_TURNS = 30;
-const AI_LIMIT_PER_HOUR = Number(env.AI_LIMIT_PER_HOUR || 40); // per person, stops runaway cost or abuse
-const MEDIA_TO_AI = env.MEDIA_TO_AI !== "false"; // set to "false" to stop sending voice notes/images to Gemini
-const MAX_MEDIA_BYTES = 8 * 1024 * 1024;
-const BLOCKED_NUMBERS = (env.BLOCKED_NUMBERS || "").split(",").map((s) => s.trim()).filter(Boolean);
-const MEDESK_URL = "https://app.medesk.net/patient/?e=654e537f7c6e2b0706f9c9c0&a=anonymous";
-// Google Sheets (optional)
-const SHEET_ID = env.GOOGLE_SHEET_ID || "";
-const SHEET_LEADS_TAB = env.GOOGLE_SHEET_LEADS_TAB || "Leads";
-const SHEET_PAYMENTS_TAB = env.GOOGLE_SHEET_PAYMENTS_TAB || "Payments";
+// ====== WHATSAPP FLOW (in-chat form) ======
+// Get this ID after creating and publishing your Flow in WhatsApp Manager
+const QUOTE_FLOW_ID = process.env.QUOTE_FLOW_ID || "PASTE_YOUR_FLOW_ID_HERE";
 
-const WEBSITE_URLS = (env.WEBSITE_URLS ||
-  "https://triplehfertilityhub.com,https://triplehfertilityhub.com/services,https://triplehfertilityhub.com/resources,https://triplehfertilityhub.com/book,https://triplehfertilityhub.com/contact,https://triplehfertilityhub.com/about")
-  .split(",").map((s) => s.trim()).filter(Boolean);
+// ====== CUSTOM CRM (Supabase) ======
+const SUPABASE_URL = process.env.SUPABASE_URL || "PASTE_YOUR_SUPABASE_PROJECT_URL_HERE";
+const SUPABASE_KEY = process.env.SUPABASE_KEY || "PASTE_YOUR_SUPABASE_ANON_KEY_HERE";
+const CRM_SECRET = process.env.CRM_SECRET || "PASTE_A_PASSWORD_HERE"; // for viewing the leads dashboard
 
-const FEES = { registration: "₦10,000", consultation: "₦70,000", total: "₦80,000" };
-const FALLBACK_REPLY = "Sorry, I'm having trouble responding right now. A member of our team will follow up shortly.";
-const MEDIA_PLACEHOLDER = "[The patient sent an image, file or voice note that could not be opened here.]";
+// ====== ALERT YOU WHEN A HUMAN NEEDS TO STEP IN ======
+const OWNER_WHATSAPP_NUMBER = process.env.OWNER_WHATSAPP_NUMBER || "2348143594483";
+const BASE_URL = process.env.BASE_URL || "https://meta-n4tt.onrender.com";
+// If any of your approved templates have an IMAGE header, put a public image
+// URL here (e.g. your logo on your website). Leave as-is if none need one.
+const TEMPLATE_HEADER_IMAGE = process.env.TEMPLATE_HEADER_IMAGE || "";
 
-// =====================================================================================
-// 3. SMALL HELPERS
-// =====================================================================================
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const GOOGLE_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxzVu9vIlhRqJrOvPeX4Kxcno6Q-UlH3dT_-5P4J8YUiIXrx44SRlWhK1uhhKP9-x_Z/exec";
 
-function safeEqual(a, b) {
-  const ha = crypto.createHash("sha256").update(String(a)).digest();
-  const hb = crypto.createHash("sha256").update(String(b)).digest();
-  return crypto.timingSafeEqual(ha, hb);
-}
+// ====== FACEBOOK MESSENGER ======
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || "PASTE_YOUR_PAGE_ACCESS_TOKEN_HERE";
 
-// Split long replies so they fit each platform's message limit
-function chunkText(text, max) {
-  const out = [];
-  let rest = String(text).trim();
-  while (rest.length > max) {
-    let cut = rest.lastIndexOf("\n", max);
-    if (cut < max * 0.5) cut = rest.lastIndexOf(" ", max);
-    if (cut < max * 0.5) cut = max;
-    out.push(rest.slice(0, cut).trim());
-    rest = rest.slice(cut).trim();
-  }
-  if (rest) out.push(rest);
-  return out;
-}
-const LIMITS = { WhatsApp: 3800, Messenger: 1800, Instagram: 700 };
+// ====== INSTAGRAM ======
+const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || "PASTE_YOUR_INSTAGRAM_ACCESS_TOKEN_HERE";
+const IG_ACCOUNT_ID = process.env.IG_ACCOUNT_ID || "PASTE_YOUR_INSTAGRAM_ACCOUNT_ID_HERE";
 
-// Link signing: the web form link carries a signature so nobody can forge a link for someone else's chat
-const signLink = (platform, id) => crypto.createHmac("sha256", env.APP_SECRET).update(`${platform}|${id}`).digest("hex").slice(0, 32);
-const validLink = (platform, id, sig) => Boolean(platform && id && sig) && safeEqual(signLink(platform, id), sig);
-const formUrl = (platform, id) => `${BASE_URL}/book-session?p=${platform}&s=${encodeURIComponent(id)}&t=${signLink(platform, id)}`;
+// ====== CONVERSATION MEMORY (per customer, persisted in Supabase so it ======
+// ====== survives server restarts — not just kept in RAM) ======
+const SESSION_TIMEOUT_MS = Number(process.env.SESSION_TIMEOUT_HOURS || 48) * 60 * 60 * 1000;
+const conversationCache = new Map(); // in-process cache, avoids hitting Supabase on every message in a fast back-and-forth
 
-const lagosNow = () =>
-  new Date().toLocaleString("en-US", { timeZone: "Africa/Lagos", weekday: "long", hour: "numeric", minute: "2-digit", hour12: true });
-
-// =====================================================================================
-// 4. MEMORY (in RAM) AND LEADS (RAM + optional Google Sheets)
-// =====================================================================================
-const conversations = new Map(); // senderId -> { history, lastMessageTime, lastCustomerTime, platform, phoneNumberId, humanPausedUntil }
-const leads = []; // newest first; shown on /leads. Cleared on restart, so the Google Sheet is the permanent record.
-const knownNames = new Map(); // senderId -> name
-const loggedLeadOnce = new Set(); // senders already written to the sheet as "Lead" this session
-let leadSeq = 0;
-
-function getConversation(senderId) {
+async function getConversation(senderId) {
   const now = Date.now();
-  let c = conversations.get(senderId);
-  if (!c || now - c.lastMessageTime > SESSION_TIMEOUT_MS) {
-    c = { history: [], lastMessageTime: now, lastCustomerTime: null, platform: null, phoneNumberId: null, humanPausedUntil: null };
-    conversations.set(senderId, c);
+
+  const cached = conversationCache.get(senderId);
+  if (cached && now - cached.lastMessageTime < SESSION_TIMEOUT_MS) {
+    return cached;
   }
-  return c;
-}
 
-function trimHistory(convo) {
-  if (convo.history.length > MAX_HISTORY_TURNS) convo.history = convo.history.slice(-MAX_HISTORY_TURNS);
-}
-
-// ---- Google Sheets (service account, no extra libraries) ----
-let googleCreds = null;
-try {
-  if (SHEET_ID && env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-    const raw = env.GOOGLE_SERVICE_ACCOUNT_JSON.trim();
-    googleCreds = JSON.parse(raw.startsWith("{") ? raw : Buffer.from(raw, "base64").toString("utf8"));
-  }
-} catch (err) {
-  console.error("GOOGLE_SERVICE_ACCOUNT_JSON could not be read:", err.message);
-}
-let googleToken = null;
-let googleTokenExp = 0;
-
-async function getGoogleToken() {
-  if (googleToken && Date.now() < googleTokenExp - 60000) return googleToken;
-  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
-  const now = Math.floor(Date.now() / 1000);
-  const unsigned =
-    b64({ alg: "RS256", typ: "JWT" }) + "." +
-    b64({ iss: googleCreds.client_email, scope: "https://www.googleapis.com/auth/spreadsheets", aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 });
-  const signature = crypto.createSign("RSA-SHA256").update(unsigned).sign(googleCreds.private_key).toString("base64url");
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: `${unsigned}.${signature}` }),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.access_token) throw new Error(`Google token error: ${JSON.stringify(data).slice(0, 200)}`);
-  googleToken = data.access_token;
-  googleTokenExp = Date.now() + (data.expires_in || 3600) * 1000;
-  return googleToken;
-}
-
-// RAW mode on purpose: text a patient types can never be turned into a spreadsheet formula
-async function appendSheetRow(tab, values) {
-  if (!googleCreds) return false;
+  // Not in memory (likely a fresh server start) — check Supabase for a still-valid session
   try {
-    const token = await getGoogleToken();
-    const range = encodeURIComponent(`${tab}!A:Z`);
-    const res = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
-      { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [values] }) }
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/conversations?sender_id=eq.${encodeURIComponent(senderId)}&select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
     );
-    if (!res.ok) {
-      console.error(`Google Sheets append to "${tab}" failed:`, res.status, (await res.text()).slice(0, 300));
-      return false;
+    const rows = await response.json();
+    const row = rows?.[0];
+    if (row && now - new Date(row.last_message_time).getTime() < SESSION_TIMEOUT_MS) {
+      const restored = {
+        history: row.history || [],
+        lastMessageTime: new Date(row.last_message_time).getTime(),
+        platform: row.platform || null,
+        phoneNumberId: row.phone_number_id || null,
+        humanPausedUntil: row.human_paused_until ? new Date(row.human_paused_until).getTime() : null,
+      };
+      conversationCache.set(senderId, restored);
+      return restored;
     }
-    return true;
   } catch (err) {
-    console.error("Google Sheets error:", err.message);
-    return false;
+    console.error("Failed to load conversation from Supabase:", err);
+  }
+
+  const fresh = { history: [], lastMessageTime: now, platform: null, phoneNumberId: null, humanPausedUntil: null };
+  conversationCache.set(senderId, fresh);
+  return fresh;
+}
+
+async function saveConversation(senderId, convo) {
+  conversationCache.set(senderId, convo);
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/conversations`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates",
+      },
+      body: JSON.stringify({
+        sender_id: senderId,
+        history: convo.history,
+        last_message_time: new Date(convo.lastMessageTime).toISOString(),
+        platform: convo.platform || null,
+        phone_number_id: convo.phoneNumberId || null,
+        human_paused_until: convo.humanPausedUntil ? new Date(convo.humanPausedUntil).toISOString() : null,
+      }),
+    });
+  } catch (err) {
+    console.error("Failed to save conversation to Supabase:", err);
   }
 }
 
-const stamp = () => new Date().toLocaleString("en-GB", { timeZone: "Africa/Lagos", hour12: false });
-
-// Record a lead. type = "Lead" (name captured in chat) or "Booking" (a real appointment request)
-async function recordLead(platform, senderId, data, type) {
-  const rec = {
-    id: ++leadSeq,
-    created: new Date().toISOString(),
-    type,
-    platform,
-    senderId,
-    name: clip(data.name, 80),
-    phone: clip(data.phone, 30),
-    email: clip(data.email, 100),
-    service: clip(data.service, 80),
-    mode: clip(data.mode, 40),
-    day: clip(data.day, 30),
-    time: clip(data.time, 40),
-    notes: clip(data.notes, 300),
-    status: "new",
-  };
-  leads.unshift(rec);
-  if (leads.length > 500) leads.pop();
-  if (rec.name) knownNames.set(senderId, rec.name);
-
-  // Write "Lead" rows only once per person per session so the sheet is not flooded with updates
-  if (type === "Lead") {
-    if (loggedLeadOnce.has(senderId)) return rec;
-    loggedLeadOnce.add(senderId);
+// Periodic cleanup of the in-process cache only — Supabase rows are cheap to keep
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, convo] of conversationCache) {
+    if (now - convo.lastMessageTime > SESSION_TIMEOUT_MS) conversationCache.delete(id);
   }
-  await appendSheetRow(SHEET_LEADS_TAB, [
-    stamp(), type, platform, rec.name, rec.phone || (platform === "WhatsApp" ? senderId : ""), rec.email,
-    rec.service, rec.mode, rec.day, rec.time, rec.notes,
-  ]);
-  return rec;
-}
+}, 60 * 60 * 1000);
 
-// =====================================================================================
-// 5. LIVE WEBSITE CONTENT (so the assistant stays current when the site changes)
-// =====================================================================================
-let websiteContent = "";
+// ====== NUMBERS TO NEVER AUTO-RESPOND TO ======
+// Add any number here (in international format, no + or spaces, e.g. "2348012345678")
+// and the bot will completely ignore messages from it — no AI reply, no log of content.
+const BLOCKED_NUMBERS = [
+  // "2348012345678", // example: boss's number
+];
+
+// ====== WEBSITE PAGES TO PULL LIVE CONTENT FROM ======
+// Add any URLs you want the AI to stay up to date on. It re-fetches these
+// automatically every few hours, so editing your website updates the AI too.
+const WEBSITE_URLS = [
+   "https://triplehfertilityhub.com",
+  "https://triplehfertilityhub.com/resources",
+  "https://triplehfertilityhub.com/book",
+  "https://triplehfertilityhub.com/contact",
+  "https://triplehfertilityhub.com/about",
+];
+
+let cachedWebsiteContent = ""; // filled in automatically, don't edit
 
 async function refreshWebsiteContent() {
+  console.log("Refreshing website content...");
   const pages = [];
   for (const url of WEBSITE_URLS) {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20000);
-      // Jina Reader renders JavaScript-built sites (like this one) and returns clean text
-      const res = await fetch(`https://r.jina.ai/${url}`, { signal: controller.signal });
-      clearTimeout(timer);
-      if (!res.ok) { console.error(`Website fetch ${url} returned ${res.status}`); continue; }
-      pages.push(`--- Content from ${url} ---\n${(await res.text()).trim().slice(0, 4000)}`);
+      const timeout = setTimeout(() => controller.abort(), 20000); // rendering takes longer than a plain fetch
+
+      // Route through Jina AI's free Reader API — it actually renders the
+      // page (including JavaScript-built sites like React/Next.js) and
+      // returns clean text, instead of us getting an empty HTML shell.
+      const response = await fetch(`https://r.jina.ai/${url}`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        console.error(`Fetch ${url} returned status ${response.status}`);
+        continue;
+      }
+
+      const text = (await response.text()).trim().slice(0, 4000); // cap length
+      pages.push(`--- Content from ${url} ---\n${text}`);
+      console.log(`Fetched ${text.length} characters from ${url}`);
     } catch (err) {
-      console.error(`Website fetch failed for ${url}:`, err.message);
+      console.error(`Failed to fetch ${url}:`, err.message);
     }
   }
-  if (pages.length) websiteContent = pages.join("\n\n"); // keep the old copy if everything failed
-  console.log(`Website content refreshed (${websiteContent.length} characters)`);
+  cachedWebsiteContent = pages.join("\n\n");
+  console.log("Website content refreshed:", new Date().toISOString(), `(${cachedWebsiteContent.length} total characters cached)`);
 }
 
-// =====================================================================================
-// 6. WHAT NURSE HOPE KNOWS AND HOW SHE BEHAVES
-// =====================================================================================
+// Fetch once on startup, then refresh every 6 hours
+refreshWebsiteContent();
+setInterval(refreshWebsiteContent, 6 * 60 * 60 * 1000);
+
+// ====== YOUR BUSINESS INFO GOES HERE ======
+// This is what the AI uses to answer questions. Edit this freely.
+// ====== YOUR BUSINESS INFO GOES HERE ======
 const BUSINESS_CONTEXT = `
 You are "Nurse Hope" - the compassionate virtual nurse and fertility care navigator at Triple H Fertility Hub and Specialist Hospital, located in Surulere, Lagos, Nigeria. You are the warm, trusted front line of our clinic, dedicated to supporting individuals and couples on their fertility and reproductive health journey with empathy, clinical discretion, clarity, and professionalism.
-You are an AI virtual assistant, not a human nurse or doctor. If anyone asks whether you are a person or a bot, say honestly that you are an AI virtual assistant.
 
 Your personality:
 - You are warm, empathetic, respectful, and reassuring. Fertility journeys are emotionally sensitive; always make patients feel heard, respected, and safe.
@@ -316,24 +193,21 @@ When greeting on the very first message of a conversation, introduce yourself: "
 ADAPT YOUR ROLE TO WHAT THE MOMENT NEEDS
 - Curious or first-time inquiry: WARM GUIDE. Provide gentle, encouraging information about how Triple H helps couples and individuals overcome fertility challenges.
 - Anxious patient or someone sharing fertility struggles: EMPATHETIC NURSE. Listen, validate their feelings, reassure them that difficulty conceiving is common and treatable, and guide them toward a confidential consultation with our specialist doctor.
-- Inquiring about prices or treatment options: CLEAR NAVIGATOR. Explain our transparent initial fees (Registration ${FEES.registration} + Consultation ${FEES.consultation} = ${FEES.total} total). For comprehensive treatments like IVF, egg freezing, or surgery, explain that treatment protocols are strictly tailored to each patient's medical tests, and our consultant will provide their exact plan during consultation.
+- Inquiring about prices or treatment options: CLEAR NAVIGATOR. Explain our transparent initial fees (Registration ₦10,000 + Consultation ₦70,000 = ₦80,000 total). For comprehensive treatments like IVF, egg freezing, or surgery, explain that treatment protocols are strictly tailored to each patient's medical tests, and our consultant will provide their exact plan during consultation.
 - Existing patient or follow-up: PATIENT CARE COORDINATOR. Prioritize their needs, help them reach the nursing station or reception, and ensure they feel well cared for.
-- Ready to book: APPOINTMENT SCHEDULER. The booking form is sent to them automatically (see BOOKING FORM below).
+- Ready to book: APPOINTMENT SCHEDULER. Collect their preferred day and time (within clinic hours: Mon-Thu 9am-6pm, Sat 10am-4pm) or offer our Medesk patient portal link.
 
 MEDICAL SAFETY & TRIAGE BOUNDARIES (CRITICAL HEALTHCARE RULES)
 - You are an AI virtual nurse, NOT a medical doctor.
-- You NEVER diagnose conditions, prescribe medications, alter drug dosages, or interpret lab results or scan images as definitive. If a patient sends test results or scans, do not interpret them; say Dr. Haleemah or the team will review them properly in consultation.
+- You NEVER diagnose conditions, prescribe medications, alter drug dosages, or interpret lab results as definitive.
 - Always gently remind patients that a definitive diagnosis and personalized treatment plan requires a formal consultation with Dr. Haleemah Olalere.
-- Never predict someone's chances of pregnancy and never promise success rates.
-- RED-FLAG MEDICAL EMERGENCIES: If a patient mentions heavy vaginal bleeding, acute severe lower abdominal/pelvic pain, fainting, high fever following a recent procedure, or suspected ectopic pregnancy, advise them immediately to proceed to the nearest hospital emergency room or call the clinic, and include the HANDOFF tag.
-- If someone says they want to harm themselves or seems in crisis, respond with care, encourage them to contact local emergency services or someone they trust right now, and include the HANDOFF tag.
-- Do not ask patients for detailed medical history, ID numbers or card details in chat. Those are for the consultation.
+- RED-FLAG MEDICAL EMERGENCIES: If a patient mentions heavy vaginal bleeding, acute severe lower abdominal/pelvic pain, fainting, high fever following a recent procedure, or suspected ectopic pregnancy, advise them immediately to proceed to the nearest hospital emergency room.
 
 USE DISCRETION - NOT EVERYONE IS A PATIENT
 - Someone asking about nursing jobs, medical officer positions, internships, or IT placements: warmly direct them to email their CV to 3hfertilityhub@gmail.com for review by management.
 - Medical reps, pharmaceutical vendors, or media: politely direct them to 3hfertilityhub@gmail.com.
 
-CLINIC INFORMATION (this section is the source of truth for fees, payment, hours and contacts)
+CLINIC INFORMATION
 - Hospital: Triple H Fertility Hub and Specialist Hospital
 - Lead Doctor: Dr. Haleemah (FDH) Olalere - Consultant Obstetrician & Gynaecologist and Fertility Specialist
 - Chairman: Dr. Ishaq Olalere
@@ -350,7 +224,7 @@ CLINIC INFORMATION (this section is the source of truth for fees, payment, hours
 - Primary WhatsApp: +234 803 404 3725 (08034043725)
 - Official Email: 3hfertilityhub@gmail.com
 - Website: https://triplehfertilityhub.com
-- Online Booking Portal (Medesk): ${MEDESK_URL}
+- Online Booking Portal (Medesk): https://app.medesk.net/patient/?e=654e537f7c6e2b0706f9c9c0&a=anonymous
 
 WHAT TRIPLE H DOES - CLINICAL SERVICES
 
@@ -382,13 +256,30 @@ WHAT TRIPLE H DOES - CLINICAL SERVICES
 FEES & PAYMENT DETAILS
 
 CONSULTATION & REGISTRATION
-- Registration & Hospital Card: ${FEES.registration} (~$8)
-- Specialist Doctor Consultation: ${FEES.consultation} (~$47)
-- Total Initial Booking: ${FEES.total}
+- Registration & Hospital Card: ₦10,000 (~$8)
+- Specialist Doctor Consultation: ₦70,000 (~$47)
+- Total Initial Booking: ₦80,000
 - Comprehensive treatment plans (e.g., IVF cycle, laparoscopy) are customized after clinical evaluation. Medications and specific protocols vary based on age, AMH, and medical findings.
-- Never invent prices, discounts or packages beyond what is written here.
 
-BANK ACCOUNTS FOR PAYMENT (share these only when a patient asks how to pay or says they are ready to pay)
+APPOINTMENT BOOKING CONVERSATION FLOW:
+When a patient expresses interest in booking an appointment, seeing a doctor, or having a consultation:
+1. Greet warmly and ask for their Full Name.
+2. Ask for their preferred Area of Care (IVF, Fertility Assessment, Gynaecology, Ultrasound, etc.) and Mode:
+   - In-Person at No. 5 Onitolo Street, Surulere, Lagos
+   - Telemedicine (Online video/phone call)
+3. Ask for their preferred Day and Time within clinic working hours:
+   - Monday to Thursday: 9:00 AM – 6:00 PM WAT
+   - Saturday: 10:00 AM – 4:00 PM WAT
+   - (Remind gently that the clinic is closed on Fridays and Sundays)
+4. Mention the standard fees:
+   - Registration / Card: ₦10,000 ($8)
+   - Doctor Consultation: ₦70,000 ($47)
+   - Bank: Providus Bank, Account: 1305084494 (Triple H Fertility Hub)
+5. The moment you have their Name, Service, and Preferred Date/Time, output this exact hidden tag in your response:
+   [SAVE_LEAD:{"name":"Patient Name","phone":"","email":"","service":"IVF","mode":"In-Person","date":"2026-11-25","time":"10:00 AM","notes":"Patient notes or symptoms"}]
+6. Reassure them that their appointment request has been logged and the Triple H admin team will reach out directly to confirm the exact slot and verify payment.
+
+BANK ACCOUNTS FOR PAYMENT
 - Naira Account: Providus Bank | Triple H Fertility Hub | Account No: 1305084494
 - USD / Foreign Currency Account: Alternative Bank / Sterling Bank | Account No: 0505541753 (For patients abroad)
 - Payment confirmation: Patients transfer to either account, then proceed on WhatsApp or submit receipt details. Accounts are verified by the finance team before formal receipt issuance.
@@ -400,10 +291,15 @@ When someone reaches out about fertility or a service, warmly ask 1 short questi
 Example: "I want to ask about IVF" -> "Welcome to Triple H! We would love to support you. Have you or your partner previously done any fertility tests, or is this your first time exploring fertility care?"
 
 Step 2 - Give clear, compassionate answers.
-Answer their questions honestly. Provide the published consultation fees (${FEES.registration} card + ${FEES.consultation} consultation = ${FEES.total}) whenever they ask about cost, and explain that treatments like IVF or surgery are customized after their initial evaluation with Dr. Haleemah.
+Answer their questions honestly. Provide the published consultation fees (₦10,000 card + ₦70,000 consultation = ₦80,000) whenever they ask about cost, and explain that treatments like IVF or surgery are customized after their initial evaluation with Dr. Haleemah.
 
 Step 3 - Offer appointment booking.
-When they are ready to schedule or speak with Dr. Haleemah, include the [BOOK_CALL] tag. The system then sends them our interactive booking form automatically (service, in-person or online, preferred day and time).
+When they are ready to schedule or speak with Dr. Haleemah, invite them:
+"We can book a consultation slot for you (in-person at Surulere or via telemedicine online). Which day works best for you between Monday to Thursday (9am-6pm) or Saturday (10am-4pm)?"
+If they are ready to proceed, include [BOOK_CALL] at the start of your message.
+
+Step 4 - Direct booking option.
+If they prefer self-scheduling online, they can also use our secure Medesk portal: https://app.medesk.net/patient/?e=654e537f7c6e2b0706f9c9c0&a=anonymous
 
 CONVERSATION RULES
 - Write like a caring healthcare professional texting on WhatsApp.
@@ -415,757 +311,1583 @@ CONVERSATION RULES
 - NEVER ask for their phone number on WhatsApp - it is already their sender ID! Once you have their name and area of care, save the lead.
 - On Messenger/Instagram: ask for their WhatsApp number so our nursing team can follow up directly.
 - Match English or Nigerian Pidgin naturally.
-- If the clinic is closed right now (use the Lagos time given below), mention that the team will reply on the next working day.
 
 WHEN SOMEONE SAYS HI / HELLO
 "Hello! I'm Nurse Hope from Triple H Fertility Hub 👋 May I know your name, and how can we support your health or fertility journey today?"
 
-BOOKING FORM
-- When the patient wants to book, start your reply with [BOOK_CALL] and write ONE short line such as "Lovely! I'm sending you our quick booking form now." Do NOT ask them for day, time or other booking details in chat, the form collects all of that.
-- After they submit the form, the system confirms it. You do not need to repeat the details.
+IF THIS IS WHATSAPP
+- You already know their phone number automatically. NEVER ask for their number on WhatsApp.
+- Once you know their NAME and care interest, save the lead immediately.
+
+TECHNICAL NOTE - BOOKING TAG
+- Include [BOOK_CALL] at the very start of your reply when the patient is ready to book a consultation slot.
 
 TECHNICAL NOTE - PAYMENT CLAIMS
 - When a patient says they have made a bank transfer, reassure them warmly:
-  "Thank you! Our finance desk is confirming your transfer with the bank now. Once confirmed, our team will send your official receipt here."
+  "Thank you! Our finance desk is confirming your transfer with the bank now. Once confirmed, your official receipt will be sent to you here."
   Include this tag anywhere in your reply:
   [PAYMENT_CLAIM:{"name":"their name","service":"consultation or treatment","amount":"amount mentioned","notes":"bank or reference if given"}]
 
 TECHNICAL NOTE - SAVING LEAD INFO
 - Include this tag when a patient shares their name or details:
-  [SAVE_LEAD:{"name":"their name","phone":"their number or empty string","email":"their email or empty string","service":"service of interest","notes":"general note only, no medical details"}]
-
-TECHNICAL NOTE - BRINGING IN A HUMAN
-- For emergencies, complaints, requests to speak to a doctor or staff member, or anything outside your role, include this tag and tell the patient a team member will follow up:
-  [HANDOFF:{"reason":"short reason with no medical details"}]
+  [SAVE_LEAD:{"name":"their name","phone":"their number or empty string","email":"their email or empty string","service":"service of interest","notes":"in-person or telemedicine, preferred day/time, etc."}]
 `;
 
-// =====================================================================================
-// 7. TALKING TO GEMINI
-// =====================================================================================
-// Gemini needs the first turn to be from the user and turns to alternate
-function normalizeHistory(history) {
-  const out = [];
-  for (const turn of history) {
-    const text = turn.parts?.[0]?.text || "";
-    if (!text) continue;
-    if (out.length === 0 && turn.role !== "user") continue;
-    const last = out[out.length - 1];
-    if (last && last.role === turn.role) last.parts[0].text += "\n" + text;
-    else out.push({ role: turn.role, parts: [{ text }] });
-  }
-  return out;
-}
-
-async function askGemini(senderId, userText, platform, media, phoneNumberId) {
-  const convo = getConversation(senderId);
-
-  let returningNote = "";
-  if (convo.history.length === 0 && knownNames.has(senderId)) {
-    returningNote = `\n\nRETURNING PATIENT: We have spoken before and know their name is ${knownNames.get(senderId)}. Greet them warmly by name instead of the full first-time introduction, and do not ask for their name again.`;
-  }
-
-  const systemText =
-    `${BUSINESS_CONTEXT}\n\nCURRENT PLATFORM: ${platform}\nCURRENT DAY AND TIME IN NIGERIA: ${lagosNow()}. Use it to greet appropriately and to know whether the clinic is open.${returningNote}` +
-    (websiteContent
-      ? `\n\nWEBSITE CONTENT (use it for general descriptions of services and articles. For fees, payment, hours and contacts, the CLINIC INFORMATION above always wins):\n${websiteContent}`
-      : "");
-
-  const parts = [{ text: userText }];
-  if (media) parts.push({ inlineData: { mimeType: media.mimeType, data: media.base64Data } });
-  const contents = [...normalizeHistory(convo.history), { role: "user", parts }];
-
-  let reply = null;
+async function getKnownName(senderId) {
   try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
-      body: JSON.stringify({ system_instruction: { parts: [{ text: systemText }] }, contents, generationConfig: { temperature: 0.4 } }),
-    });
-    const data = await res.json();
-    if (!res.ok || data.error) console.error("Gemini error:", JSON.stringify(data.error || data).slice(0, 400));
-    else reply = data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim() || null;
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/leads?sender_id=eq.${encodeURIComponent(senderId)}&name=not.is.null&order=created_at.desc&limit=1&select=name`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = await response.json();
+    return rows?.[0]?.name || null;
   } catch (err) {
-    console.error("Gemini request failed:", err.message);
+    console.error("Failed to look up known name:", err);
+    return null;
   }
-
-  if (!reply) return null; // do not store failed exchanges in the memory
-
-  convo.history.push({ role: "user", parts: [{ text: userText }] });
-  convo.history.push({ role: "model", parts: [{ text: reply }] });
-  convo.lastMessageTime = Date.now();
-  convo.platform = platform;
-  if (phoneNumberId) convo.phoneNumberId = phoneNumberId;
-  trimHistory(convo);
-  return reply;
 }
-
-// =====================================================================================
-// 8. SENDING MESSAGES (WhatsApp, Messenger, Instagram)
-// =====================================================================================
-const messageStore = new Map(); // WhatsApp message id -> { text, time } (so we understand quoted replies)
-
-// WhatsApp normally uses phone numbers. If a person has no number visible (username accounts), Meta gives an ID instead.
-const waTarget = (id) => (/^\d{5,16}$/.test(String(id)) ? { to: String(id) } : { recipient: String(id) });
-
-async function waPost(phoneNumberId, body) {
-  if (!WHATSAPP_TOKEN || !phoneNumberId) { console.error("WhatsApp is not configured (WHATSAPP_TOKEN / PHONE_NUMBER_ID)"); return { ok: false, data: null }; }
+async function saveLead(platform, senderId, leadData) {
   try {
-    const res = await fetch(`${GRAPH}/${phoneNumberId}/messages`, {
+    const payload = {
+      name: leadData.name || "WhatsApp Patient",
+      phone: leadData.phone || senderId,
+      email: leadData.email || "",
+      service: leadData.service || "Fertility Consultation",
+      mode: leadData.mode || "In-Person",
+      date: leadData.date || "",
+      time: leadData.time || "",
+      source: "WhatsApp Bot",
+      notes: leadData.notes || ""
+    };
+
+    console.log(`[Google Sheet] Logging lead for ${senderId}:`, payload);
+
+    const response = await fetch(GOOGLE_SHEET_WEBHOOK_URL, {
       method: "POST",
-      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ messaging_product: "whatsapp", ...body }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) console.error("WhatsApp send failed:", JSON.stringify(data).slice(0, 500));
-    return { ok: res.ok, data };
+
+    const result = await response.text();
+    console.log(`[Google Sheet] Response:`, result);
   } catch (err) {
-    console.error("WhatsApp send error:", err.message);
-    return { ok: false, data: null };
+    console.error("[Google Sheet] Failed to log lead:", err.message);
   }
 }
 
-async function sendWhatsAppText(to, text, phoneNumberId = PHONE_NUMBER_ID) {
-  let allOk = true;
-  for (const piece of chunkText(text, LIMITS.WhatsApp)) {
-    const { ok, data } = await waPost(phoneNumberId, { ...waTarget(to), type: "text", text: { body: piece } });
-    if (ok) {
-      const id = data?.messages?.[0]?.id;
-      if (id) messageStore.set(id, { text: piece, time: Date.now() });
-    } else allOk = false;
-  }
-  return allOk;
-}
-
-// Template messages still arrive when the 24-hour window is closed (used for staff alerts)
-async function sendWhatsAppTemplate(to, templateName, params = []) {
-  const clean = (p) => String(p).replace(/[\r\n\t]+/g, " | ").replace(/ {2,}/g, " ").trim();
-  const template = { name: templateName, language: { code: "en" } };
-  if (params.length) template.components = [{ type: "body", parameters: params.map((p) => ({ type: "text", text: clean(p) })) }];
-  const { ok } = await waPost(PHONE_NUMBER_ID, { to, type: "template", template });
-  return ok;
-}
-
-async function sendMessengerText(recipientId, text) {
-  if (!PAGE_ACCESS_TOKEN) { console.error("Messenger is not configured (PAGE_ACCESS_TOKEN)"); return false; }
-  let allOk = true;
-  for (const piece of chunkText(text, LIMITS.Messenger)) {
-    try {
-      const res = await fetch(`${GRAPH}/me/messages`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${PAGE_ACCESS_TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ recipient: { id: recipientId }, messaging_type: "RESPONSE", message: { text: piece } }),
-      });
-      if (!res.ok) { console.error("Messenger send failed:", (await res.text()).slice(0, 400)); allOk = false; }
-    } catch (err) { console.error("Messenger send error:", err.message); allOk = false; }
-  }
-  return allOk;
-}
-
-async function sendInstagramText(recipientId, text) {
-  if (!IG_ACCESS_TOKEN || !IG_ACCOUNT_ID) { console.error("Instagram is not configured (IG_ACCESS_TOKEN / IG_ACCOUNT_ID)"); return false; }
-  let allOk = true;
-  for (const piece of chunkText(text, LIMITS.Instagram)) {
-    try {
-      const res = await fetch(`${GRAPH_IG}/${IG_ACCOUNT_ID}/messages`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${IG_ACCESS_TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ recipient: { id: recipientId }, message: { text: piece } }),
-      });
-      if (!res.ok) { console.error("Instagram send failed:", (await res.text()).slice(0, 400)); allOk = false; }
-    } catch (err) { console.error("Instagram send error:", err.message); allOk = false; }
-  }
-  return allOk;
-}
-
-function sendToPlatform(platform, to, text, phoneNumberId) {
-  if (platform === "WhatsApp") return sendWhatsAppText(to, text, phoneNumberId || PHONE_NUMBER_ID);
-  if (platform === "Messenger") return sendMessengerText(to, text);
-  if (platform === "Instagram") return sendInstagramText(to, text);
-  return Promise.resolve(false);
-}
-
-async function markAsReadAndTyping(messageId, phoneNumberId) {
-  if (!messageId) return;
-  await waPost(phoneNumberId, { status: "read", message_id: messageId, typing_indicator: { type: "text" } });
-}
-
-// Alert the clinic team on WhatsApp. First a normal message (instant); if that is refused because
-// the 24-hour window is closed, fall back to an approved template named "lead_alert" with ONE variable.
-async function notifyStaff(text) {
-  if (!STAFF_WHATSAPP_NUMBER) { console.log("[staff alert - set STAFF_WHATSAPP_NUMBER to receive these on WhatsApp]\n" + text); return; }
-  const sent = await sendWhatsAppText(STAFF_WHATSAPP_NUMBER, `🔔 Triple H alert\n\n${text}`);
-  if (!sent) await sendWhatsAppTemplate(STAFF_WHATSAPP_NUMBER, "lead_alert", [text.slice(0, 900)]);
-}
-
-// =====================================================================================
-// 9. SENDING THE BOOKING FORM TO THE PATIENT
-// =====================================================================================
-const BOOKING_INTRO =
-  "Tap the button below to open our quick booking form. Our team will confirm your exact appointment time.\n\n" +
-  `Initial visit: ${FEES.total} (${FEES.registration} card + ${FEES.consultation} consultation)\n` +
-  "Hours: Mon-Thu 9am-6pm, Sat 10am-4pm";
-
-// WhatsApp: a message with a "Book appointment" button that opens the web form
-async function sendBookingButtonWhatsApp(to, phoneNumberId = PHONE_NUMBER_ID) {
-  const url = formUrl("WhatsApp", to);
-  const { ok } = await waPost(phoneNumberId, {
-    recipient_type: "individual",
-    ...waTarget(to),
-    type: "interactive",
-    interactive: {
-      type: "cta_url",
-      header: { type: "text", text: "Book a Consultation" },
-      body: { text: BOOKING_INTRO },
-      footer: { text: "Triple H Fertility Hub" },
-      action: { name: "cta_url", parameters: { display_text: "Book appointment", url } },
-    },
-  });
-  if (ok) return true;
-  // Fallback: a plain text link always works
-  return sendWhatsAppText(to, `${BOOKING_INTRO}\n\n${url}`, phoneNumberId);
-}
-
-// Messenger / Instagram: a button that opens our web form
-async function sendBookingButton(platform, to) {
-  const url = formUrl(platform, to);
-  const text = "Tap below to open our quick booking form. Our team will confirm your exact appointment time.";
-  const message = {
-    attachment: { type: "template", payload: { template_type: "button", text, buttons: [{ type: "web_url", url, title: "Book appointment" }] } },
-  };
+async function saveLead(platform, senderId, leadData) {
   try {
-    let res;
-    if (platform === "Messenger" && PAGE_ACCESS_TOKEN) {
-      res = await fetch(`${GRAPH}/me/messages`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${PAGE_ACCESS_TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ recipient: { id: to }, messaging_type: "RESPONSE", message }),
-      });
-    } else if (platform === "Instagram" && IG_ACCESS_TOKEN && IG_ACCOUNT_ID) {
-      res = await fetch(`${GRAPH_IG}/${IG_ACCOUNT_ID}/messages`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${IG_ACCESS_TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ recipient: { id: to }, message }),
-      });
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/leads`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        platform,
+        sender_id: senderId,
+        name: leadData.name || null,
+        phone: leadData.phone || null,
+        email: leadData.email || null,
+        service_interest: leadData.service || null,
+        notes: leadData.notes || null,
+      }),
+    });
+    if (!response.ok) console.error("Failed to save lead:", await response.text());
+    else console.log(`Lead saved for ${senderId}`);
+  } catch (err) {
+    console.error("Error saving lead:", err);
+  }
+}
+
+// ====== Summarize a full conversation for the owner alert (not just the last message) ======
+async function summarizeConversation(senderId) {
+  const convo = await getConversation(senderId);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
+
+  const summaryInstruction =
+    "Summarize this customer conversation in 3-5 short sentences for a busy business owner. " +
+    "Include: what they need/want, any key requirements or details they mentioned, budget or " +
+    "timeline if discussed, and their name/contact info if they gave it. Be specific, not generic. " +
+    "Write in PLAIN TEXT ONLY — no Markdown, no **bold**, no bullet points with asterisks or dashes, " +
+    "no headers. Just plain flowing sentences, since this gets sent as a WhatsApp message where " +
+    "Markdown symbols show up as literal characters.";
+
+  const contents = [...convo.history, { role: "user", parts: [{ text: summaryInstruction }] }];
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents }),
+    });
+    const data = await response.json();
+    const summary = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    return summary || "Could not generate summary — check the leads dashboard or Render logs for the full conversation.";
+  } catch (err) {
+    console.error("Failed to summarize conversation:", err);
+    return "Could not generate summary — check the leads dashboard or Render logs for the full conversation.";
+  }
+}
+
+// ====== Process an AI reply: strip special tags, act on them, return clean text ======
+async function processAIReply(aiReply, platform, senderId, userMessage, phoneNumberId = PHONE_NUMBER_ID) {
+  let cleanReply = aiReply;
+  let shouldBookCall = false;
+
+    const saveLeadMatch = cleanReply.match(/\[SAVE_LEAD:(\{.*?\})\]/);
+  if (saveLeadMatch) {
+    try {
+      const leadData = JSON.parse(saveLeadMatch[1]);
+      if (platform === "WhatsApp" && !leadData.phone) {
+        leadData.phone = senderId;
+      }
+      await saveLead(platform, senderId, leadData);
+    } catch (err) {
+      console.error("Failed to parse SAVE_LEAD tag:", err);
     }
-    if (res?.ok) return true;
-    if (res) console.error(`${platform} button send failed:`, (await res.text()).slice(0, 300));
-  } catch (err) {
-    console.error(`${platform} button send error:`, err.message);
+    cleanReply = cleanReply.replace(saveLeadMatch[0], "").trim();
   }
-  // Fallback: a plain text link always works
-  return sendToPlatform(platform, to, `${text}\n${url}`);
-}
 
-async function sendBookingForm(platform, senderId, phoneNumberId) {
-  if (platform === "WhatsApp") await sendBookingButtonWhatsApp(senderId, phoneNumberId);
-  else await sendBookingButton(platform, senderId);
-}
-
-// A submitted booking form ends up here
-async function recordBooking(platform, senderId, rawForm, phoneNumberId) {
-  const form = normalizeSubmission(rawForm);
-  if (platform === "WhatsApp" && !form.phone && /^\d{5,16}$/.test(senderId)) form.phone = senderId;
-
-  await recordLead(platform, senderId, form, "Booking");
-
-  await notifyStaff(
-    `New appointment request (${platform})\n` +
-    `Name: ${form.name || "-"}\nPhone: ${form.phone || "-"}\nEmail: ${form.email || "-"}\n` +
-    `Service: ${form.service || "-"}\nType: ${form.mode || "-"}\nPreferred: ${form.day || "-"}, ${form.time || "-"}\n` +
-    `Notes: ${form.notes || "-"}\n${BASE_URL}/leads`
-  );
-
-  const first = form.name.split(" ")[0] || "there";
-  const confirmation =
-    `Thank you, ${first}! 🙏 We've received your appointment request` +
-    `${form.service ? ` for ${form.service}` : ""}${form.mode ? ` (${form.mode})` : ""}.\n` +
-    `Preferred: ${form.day || "any day"}, ${form.time || "any time"}.\n` +
-    "Our team will contact you shortly to confirm the exact date and time.";
-  await sendToPlatform(platform, senderId, confirmation, phoneNumberId);
-
-  // Keep the AI's memory in step so it does not ask for the same details again
-  const convo = getConversation(senderId);
-  convo.history.push({ role: "user", parts: [{ text: `[The patient submitted the booking form: ${form.service || "service not stated"}, ${form.mode || "type not stated"}, ${form.day || "any day"}, ${form.time || "any time"}]` }] });
-  convo.history.push({ role: "model", parts: [{ text: confirmation }] });
-  convo.lastMessageTime = Date.now();
-  convo.platform = platform;
-  if (phoneNumberId) convo.phoneNumberId = phoneNumberId;
-  trimHistory(convo);
-}
-
-// =====================================================================================
-// 10. READING THE AI'S REPLY (strip hidden tags, act on them)
-// =====================================================================================
-function extractTag(text, name) {
-  const m = text.match(new RegExp(`\\[${name}:(\\{[\\s\\S]*?\\})\\]`));
-  if (!m) return { text, data: null };
-  let data = null;
-  try { data = JSON.parse(m[1]); } catch (err) { console.error(`Bad ${name} tag:`, m[1].slice(0, 200)); }
-  return { text: text.replace(m[0], "").trim(), data };
-}
-
-async function processReply(raw, platform, senderId) {
-  let { text, data: lead } = extractTag(raw, "SAVE_LEAD");
-  let claim, handoff;
-  ({ text, data: claim } = extractTag(text, "PAYMENT_CLAIM"));
-  ({ text, data: handoff } = extractTag(text, "HANDOFF"));
-  const wantsBooking = /\[BOOK_CALL\]/.test(text);
-  text = text.replace(/\[BOOK_CALL\]/g, "").replace(/\[[A-Z_]+:\{[\s\S]*?\}\]/g, "").replace(/[ \t]{2,}/g, " ").trim(); // also removes any stray tags
-
-  if (lead) {
-    if (platform === "WhatsApp" && !lead.phone && /^\d{5,16}$/.test(senderId)) lead.phone = senderId;
-    await recordLead(platform, senderId, lead, "Lead");
+  const saveLeadMatch = cleanReply.match(/\[SAVE_LEAD:(\{.*?\})\]/);
+  if (saveLeadMatch) {
+    try {
+      const leadData = JSON.parse(saveLeadMatch[1]);
+      // On WhatsApp, the sender ID IS their phone number — always use it,
+      // never rely on the AI having asked for it separately.
+      if (platform === "WhatsApp" && !leadData.phone) {
+        leadData.phone = senderId;
+      }
+      await saveLead(platform, senderId, leadData);
+    } catch (err) {
+      console.error("Failed to parse SAVE_LEAD tag:", err);
+    }
+    cleanReply = cleanReply.replace(saveLeadMatch[0], "").trim();
   }
-  if (claim) {
-    await appendSheetRow(SHEET_PAYMENTS_TAB, [stamp(), platform, clip(claim.name, 80), platform === "WhatsApp" ? senderId : "", clip(claim.service, 80), clip(claim.amount, 40), clip(claim.notes, 200), "pending"]);
-    await notifyStaff(
-      `Payment claim (${platform})\nPatient: ${clip(claim.name, 80) || "-"} (${senderId})\nFor: ${clip(claim.service, 80) || "-"}\nAmount claimed: ${clip(claim.amount, 40) || "-"}\nNotes: ${clip(claim.notes, 200) || "-"}\n\nPlease check the bank account, then send the receipt.`
+
+  const paymentClaimMatch = cleanReply.match(/\[PAYMENT_CLAIM:(\{.*?\})\]/);
+  if (paymentClaimMatch) {
+    try {
+      const claimData = JSON.parse(paymentClaimMatch[1]);
+      await savePaymentClaim(platform, senderId, claimData, phoneNumberId);
+      await notifyOwner(
+        `Payment claim (${platform})\nCustomer: ${senderId}\nName: ${claimData.name || "-"}\nService: ${claimData.service || "-"}\nAmount claimed: ${claimData.amount || "-"}\n\nCheck your bank, then confirm at: ${BASE_URL}/pending-payments`
+      );
+    } catch (err) {
+      console.error("Failed to parse PAYMENT_CLAIM tag:", err);
+    }
+    cleanReply = cleanReply.replace(paymentClaimMatch[0], "").trim();
+  }
+
+  if (cleanReply.startsWith("[BOOK_CALL]")) {
+    shouldBookCall = true;
+    cleanReply = cleanReply.replace("[BOOK_CALL]", "").trim();
+
+    if (platform !== "WhatsApp") {
+      const formLink = `${BASE_URL}/book-session?platform=${platform}&sender=${senderId}`;
+      cleanReply = `${cleanReply}\n\n${formLink}`;
+    }
+
+    const summary = await summarizeConversation(senderId);
+    await notifyOwner(
+      `Platform: ${platform}\nCustomer: ${senderId}\n\n${summary}\n\nThey're ready to move forward — check the leads dashboard for full details.`
     );
   }
-  if (handoff) {
-    await notifyStaff(`A patient needs a team member (${platform}, ${senderId}).\nReason: ${clip(handoff.reason, 200) || "-"}\nInbox: ${BASE_URL}/inbox`);
+
+  return { cleanReply, shouldBookCall };
+}
+
+// ====== Booking form — Messenger/Instagram equivalent of WhatsApp's in-chat Flow ======
+app.get("/book-session", (req, res) => {
+  const { platform, sender } = req.query;
+  res.send(`
+    <html><body style="font-family: sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px;">
+      <h2>Book a Session with Our Tech Team</h2>
+      <p>Fill this quick form and we'll follow up with a full quote.</p>
+      <form method="POST" action="/book-session">
+        <input type="hidden" name="platform" value="${platform || ""}">
+        <input type="hidden" name="sender" value="${sender || ""}">
+        <label>Name<br><input type="text" name="name" style="width:100%; padding:8px;" required></label><br><br>
+        <label>WhatsApp Number<br><input type="text" name="phone" style="width:100%; padding:8px;" placeholder="e.g. 2348012345678"></label><br><br>
+        <label>Email (if no WhatsApp number)<br><input type="email" name="email" style="width:100%; padding:8px;"></label><br><br>
+        <label>What do you need?<br><input type="text" name="service" style="width:100%; padding:8px;" required></label><br><br>
+        <label>Anything else to add?<br><textarea name="notes" rows="4" style="width:100%; padding:8px;"></textarea></label><br><br>
+        <button type="submit" style="padding:10px 20px;">Submit</button>
+      </form>
+    </body></html>
+  `);
+});
+
+app.post("/book-session", express.urlencoded({ extended: true }), async (req, res) => {
+  const { platform, sender, name, phone, email, service, notes } = req.body;
+
+  await saveLead(platform || "Web Form", sender || "unknown", { name, phone, email, service, notes });
+  await notifyOwner(
+    `Booking form submitted (${platform || "Web"})\nName: ${name}\nPhone: ${phone || "-"}\nEmail: ${email || "-"}\nService: ${service}\nNotes: ${notes || "-"}`
+  );
+
+  // Confirm to the customer in their original chat, if we know the platform/sender
+  const confirmMsg = "Thanks! We've got your details — our team will follow up shortly 🙏";
+  if (platform === "Messenger") await sendMessengerMessage(sender, confirmMsg);
+  else if (platform === "Instagram") await sendInstagramMessage(sender, confirmMsg);
+
+  res.send(`<body style="font-family: sans-serif; text-align:center; margin-top:60px;"><h2>Thanks, ${name}! 🎉</h2><p>Our team will follow up with you shortly.</p></body>`);
+});
+
+// ====== Leads dashboard — simple password-protected page to view your CRM ======
+// ====== Generate a payment receipt PDF ======
+function generateReceiptPDF({ customerName, service, amount, date, receiptNumber }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: "A4", margin: 0 });
+    const chunks = [];
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    const brandGreen = "#0F5132";
+    const pageWidth = doc.page.width;
+
+    // Header band
+    doc.rect(0, 0, pageWidth, 130).fill(brandGreen);
+    doc.fillColor("#FFFFFF").fontSize(26).font("Helvetica-Bold").text("Nuvanta Africa", 50, 40);
+    doc.fontSize(10).font("Helvetica").text("NVA Africa Ltd  |  RC No: 9666156  |  nuvanta.africa", 50, 75);
+    doc.fontSize(20).font("Helvetica-Bold").text("RECEIPT", pageWidth - 200, 45, { width: 150, align: "right" });
+
+    // Receipt meta box
+    let y = 160;
+    doc.fillColor("#000000").fontSize(10).font("Helvetica");
+    doc.text(`Receipt No:`, 50, y);
+    doc.font("Helvetica-Bold").text(receiptNumber, 150, y);
+    doc.font("Helvetica").text(`Date:`, 350, y);
+    doc.font("Helvetica-Bold").text(date, 400, y);
+
+    y += 40;
+    doc.moveTo(50, y).lineTo(pageWidth - 50, y).strokeColor("#DDDDDD").stroke();
+    y += 25;
+
+    // Billed to
+    doc.fontSize(9).fillColor("#888888").font("Helvetica").text("RECEIVED FROM", 50, y);
+    y += 15;
+    doc.fontSize(13).fillColor("#000000").font("Helvetica-Bold").text(customerName || "Customer", 50, y);
+    y += 35;
+
+    // Line item table header
+    doc.rect(50, y, pageWidth - 100, 28).fill("#F2F2F2");
+    doc.fillColor("#555555").fontSize(9).font("Helvetica-Bold");
+    doc.text("DESCRIPTION", 60, y + 9);
+    doc.text("AMOUNT", pageWidth - 160, y + 9, { width: 100, align: "right" });
+    y += 28;
+
+    // Line item row
+    doc.rect(50, y, pageWidth - 100, 32).strokeColor("#EEEEEE").stroke();
+    doc.fillColor("#000000").fontSize(11).font("Helvetica");
+    doc.text(service || "Services rendered", 60, y + 10, { width: pageWidth - 260 });
+    doc.font("Helvetica-Bold").text(`₦${amount}`, pageWidth - 160, y + 10, { width: 100, align: "right" });
+    y += 32;
+
+    // Total band
+    doc.rect(50, y, pageWidth - 100, 40).fill(brandGreen);
+    doc.fillColor("#FFFFFF").fontSize(12).font("Helvetica-Bold");
+    doc.text("TOTAL PAID", 60, y + 13);
+    doc.fontSize(14).text(`₦${amount}`, pageWidth - 160, y + 11, { width: 100, align: "right" });
+    y += 70;
+
+    // Paid stamp
+    doc.save();
+    doc.rotate(-15, { origin: [pageWidth - 150, y] });
+    doc.fontSize(28).fillColor("#0F5132").opacity(0.25).font("Helvetica-Bold");
+    doc.text("PAID", pageWidth - 220, y - 15);
+    doc.restore();
+    doc.opacity(1);
+
+    // Footer
+    const footerY = doc.page.height - 100;
+    doc.moveTo(50, footerY).lineTo(pageWidth - 50, footerY).strokeColor("#DDDDDD").stroke();
+    doc.fillColor("#888888").fontSize(9).font("Helvetica");
+    doc.text("Thank you for your business!", 50, footerY + 15, { align: "center", width: pageWidth - 100 });
+    doc.text("Nuvanta Africa  |  nuvanta.africa  |  08143594483  |  nuvantaafrica@gmail.com", 50, footerY + 30, {
+      align: "center",
+      width: pageWidth - 100,
+    });
+
+    doc.end();
+  });
+}
+
+// ====== Upload a file to WhatsApp so it can be sent as a document ======
+async function uploadWhatsAppMedia(buffer, mimeType, filename, phoneNumberId = PHONE_NUMBER_ID) {
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("file", new Blob([buffer], { type: mimeType }), filename);
+
+  const response = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/media`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    body: form,
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    console.error("Media upload failed:", JSON.stringify(data));
+    return null;
   }
-  return { text: text || (wantsBooking ? "I'm sending you our quick booking form now." : FALLBACK_REPLY), wantsBooking };
+  return data.id;
 }
 
-// =====================================================================================
-// 11. INCOMING MESSAGES: shared pipeline for all three channels
-// =====================================================================================
-const seen = new Map(); // message ids already handled (Meta retries webhooks)
-function alreadySeen(id) {
-  if (!id) return false;
-  if (seen.has(id)) return true;
-  seen.set(id, Date.now());
-  return false;
+async function sendWhatsAppDocument(to, mediaId, filename, caption, phoneNumberId = PHONE_NUMBER_ID) {
+  const response = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "document",
+      document: { id: mediaId, filename, caption },
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) console.error("Document send failed:", JSON.stringify(data));
+  return response.ok;
 }
 
-// If someone sends several messages quickly, wait a few seconds and answer them together
-const buffers = new Map();
+// ====== Save a customer's payment claim as "pending" ======
+async function savePaymentClaim(platform, senderId, claimData, phoneNumberId = PHONE_NUMBER_ID) {
+  try {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/payments`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        platform,
+        sender_id: senderId,
+        phone: platform === "WhatsApp" ? senderId : claimData.phone || null,
+        phone_number_id: phoneNumberId,
+        customer_name: claimData.name || null,
+        service: claimData.service || null,
+        amount: claimData.amount || null,
+        notes: claimData.notes || null,
+        status: "pending",
+      }),
+    });
+    if (!response.ok) console.error("Failed to save payment claim:", await response.text());
+  } catch (err) {
+    console.error("Error saving payment claim:", err);
+  }
+}
+
+// ====== Look up this customer's most recent payment status, for context ======
+async function getPaymentStatus(senderId) {
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/payments?sender_id=eq.${encodeURIComponent(senderId)}&order=id.desc&limit=1&select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = await response.json();
+    return rows?.[0] || null;
+  } catch (err) {
+    console.error("Failed to look up payment status:", err);
+    return null;
+  }
+}
+
+// ====== Pending payments admin page — see claims and confirm with one click ======
+app.get("/pending-payments", async (req, res) => {
+  if (req.query.secret !== BROADCAST_SECRET) {
+    return res.send('<form>Password: <input type="password" name="secret"><button>View</button></form>');
+  }
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/payments?status=eq.pending&order=id.desc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const pending = await response.json();
+
+    if (!Array.isArray(pending)) {
+      console.error("Supabase payments query error:", JSON.stringify(pending));
+      return res.send(`
+        <h2>Error loading pending payments</h2>
+        <p>Supabase returned this instead of a list — likely a missing column or table issue:</p>
+        <pre>${JSON.stringify(pending, null, 2)}</pre>
+      `);
+    }
+
+    const rows = pending
+      .map(
+        (p) => `<tr>
+          <td>${p.customer_name || "-"}</td>
+          <td>${p.phone || p.sender_id}</td>
+          <td>${p.service || "-"}</td>
+          <td>₦${p.amount || "-"}</td>
+          <td>${p.notes || "-"}</td>
+          <td><a href="/confirm-payment?id=${p.id}&secret=${req.query.secret}" style="background:#0F5132;color:white;padding:6px 12px;text-decoration:none;border-radius:4px;">Confirm & Send Receipt</a></td>
+        </tr>`
+      )
+      .join("");
+    res.send(`
+      <html><body style="font-family: sans-serif;">
+        <h2>Pending Payments (${pending.length})</h2>
+        <table border="1" cellpadding="8" style="border-collapse: collapse;">
+          <tr><th>Name</th><th>Contact</th><th>Service</th><th>Amount</th><th>Notes</th><th>Action</th></tr>
+          ${rows}
+        </table>
+      </body></html>
+    `);
+  } catch (err) {
+    res.send("Error loading pending payments: " + err.message);
+  }
+});
+
+// ====== Confirm a payment — generates and sends the receipt automatically ======
+// ====== The actual receipt generation + send logic, reused by both the manual admin page AND the automatic Supabase webhook ======
+async function processPaymentConfirmation(payment) {
+  const receiptNumber = `NVA-${Date.now().toString().slice(-8)}`;
+  const date = new Date().toLocaleDateString("en-GB", { timeZone: "Africa/Lagos" });
+  const claimPhoneNumberId = payment.phone_number_id || PHONE_NUMBER_ID;
+
+  const pdfBuffer = await generateReceiptPDF({
+    customerName: payment.customer_name || "Customer",
+    service: payment.service || "Services rendered",
+    amount: payment.amount || "0",
+    date,
+    receiptNumber,
+  });
+  const mediaId = await uploadWhatsAppMedia(pdfBuffer, "application/pdf", `Receipt-${receiptNumber}.pdf`, claimPhoneNumberId);
+
+  let sent = false;
+  if (mediaId && payment.platform === "WhatsApp") {
+    sent = await sendWhatsAppDocument(
+      payment.phone || payment.sender_id,
+      mediaId,
+      `Receipt-${receiptNumber}.pdf`,
+      `Your payment has been confirmed! Here's your receipt, ${payment.customer_name || ""}. Thank you 🙏`,
+      claimPhoneNumberId
+    );
+  }
+
+  await fetch(`${SUPABASE_URL}/rest/v1/payments?id=eq.${payment.id}`, {
+    method: "PATCH",
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(
+      sent
+        ? { status: "confirmed", receipt_number: receiptNumber }
+        : { status: "send_failed", notes: `${payment.notes || ""} [Receipt generation/send failed — retry manually]`.trim() }
+    ),
+  });
+
+  return { sent, receiptNumber };
+}
+
+// ====== Manual admin page — one-click confirm ======
+// ====== Generate a payment receipt PDF ======
+function generateReceiptPDF({ customerName, service, amount, date, receiptNumber }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: "A4", margin: 0 });
+    const chunks = [];
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    const brandColor = "#761010"; // Triple H Crimson
+    const pageWidth = doc.page.width;
+
+    // Header band
+    doc.rect(0, 0, pageWidth, 130).fill(brandColor);
+    doc.fillColor("#FFFFFF").fontSize(24).font("Helvetica-Bold").text("Triple H Fertility Hub", 50, 38);
+    doc.fontSize(12).font("Helvetica").text("& Specialist Hospital", 50, 66);
+    doc.fontSize(9).font("Helvetica").text("No. 5 Onitolo Street, Gbaja, Surulere, Lagos  |  08034043725  |  3hfertilityhub@gmail.com", 50, 88);
+    doc.fontSize(20).font("Helvetica-Bold").text("RECEIPT", pageWidth - 200, 45, { width: 150, align: "right" });
+
+    // Receipt meta box
+    let y = 160;
+    doc.fillColor("#000000").fontSize(10).font("Helvetica");
+    doc.text(`Receipt No:`, 50, y);
+    doc.font("Helvetica-Bold").text(receiptNumber, 150, y);
+    doc.font("Helvetica").text(`Date:`, 350, y);
+    doc.font("Helvetica-Bold").text(date, 400, y);
+
+    y += 40;
+    doc.moveTo(50, y).lineTo(pageWidth - 50, y).strokeColor("#DDDDDD").stroke();
+    y += 25;
+
+    // Billed to
+    doc.fontSize(9).fillColor("#888888").font("Helvetica").text("RECEIVED FROM", 50, y);
+    y += 15;
+    doc.fontSize(13).fillColor("#000000").font("Helvetica-Bold").text(customerName || "Patient", 50, y);
+    y += 35;
+
+    // Line item table header
+    doc.rect(50, y, pageWidth - 100, 28).fill("#F2F2F2");
+    doc.fillColor("#555555").fontSize(9).font("Helvetica-Bold");
+    doc.text("DESCRIPTION", 60, y + 9);
+    doc.text("AMOUNT", pageWidth - 160, y + 9, { width: 100, align: "right" });
+    y += 28;
+
+    // Line item row
+    doc.rect(50, y, pageWidth - 100, 32).strokeColor("#EEEEEE").stroke();
+    doc.fillColor("#000000").fontSize(11).font("Helvetica");
+    doc.text(service || "Fertility Consultation / Clinical Service", 60, y + 10, { width: pageWidth - 260 });
+    doc.font("Helvetica-Bold").text(`₦${amount}`, pageWidth - 160, y + 10, { width: 100, align: "right" });
+    y += 32;
+
+    // Total band
+    doc.rect(50, y, pageWidth - 100, 40).fill(brandColor);
+    doc.fillColor("#FFFFFF").fontSize(12).font("Helvetica-Bold");
+    doc.text("TOTAL PAID", 60, y + 13);
+    doc.fontSize(14).text(`₦${amount}`, pageWidth - 160, y + 11, { width: 100, align: "right" });
+    y += 70;
+
+    // Paid stamp
+    doc.save();
+    doc.rotate(-15, { origin: [pageWidth - 150, y] });
+    doc.fontSize(28).fillColor(brandColor).opacity(0.25).font("Helvetica-Bold");
+    doc.text("PAID", pageWidth - 220, y - 15);
+    doc.restore();
+    doc.opacity(1);
+
+    // Footer
+    const footerY = doc.page.height - 100;
+    doc.moveTo(50, footerY).lineTo(pageWidth - 50, footerY).strokeColor("#DDDDDD").stroke();
+    doc.fillColor("#888888").fontSize(9).font("Helvetica");
+    doc.text("Thank you for trusting Triple H Fertility Hub with your care!", 50, footerY + 15, { align: "center", width: pageWidth - 100 });
+    doc.text("Triple H Fertility Hub  |  triplehfertilityhub.com  |  08034043725  |  3hfertilityhub@gmail.com", 50, footerY + 30, {
+      align: "center",
+      width: pageWidth - 100,
+    });
+
+    doc.end();
+  });
+}
+
+// ====== Inbox — see active conversations and reply directly, no template needed ======
+app.get("/inbox", async (req, res) => {
+  if (req.query.secret !== BROADCAST_SECRET) {
+    return res.send('<form>Password: <input type="password" name="secret"><button>View</button></form>');
+  }
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/conversations?platform=eq.WhatsApp&order=last_message_time.desc&limit=50`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const conversations = await response.json();
+
+    if (!Array.isArray(conversations)) {
+      return res.send(`<h2>Error</h2><pre>${JSON.stringify(conversations, null, 2)}</pre>`);
+    }
+
+    const rows = conversations
+      .map((c) => {
+        const lastMsg = c.history?.[c.history.length - 1]?.parts?.[0]?.text || "(no messages)";
+        const hoursAgo = Math.round((Date.now() - new Date(c.last_message_time).getTime()) / 3600000);
+        const windowOpen = hoursAgo < 24;
+        const isPaused = c.human_paused_until && new Date(c.human_paused_until).getTime() > Date.now();
+        return `<tr>
+          <td>${isPaused ? "🟡" : "🟢"} ${c.sender_id}</td>
+          <td style="max-width:400px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${lastMsg}</td>
+          <td>${hoursAgo}h ago</td>
+          <td style="color:${windowOpen ? "green" : "#999"};">${windowOpen ? "Open ✓" : "Closed (needs template)"}</td>
+          <td><a href="/inbox/chat?sender=${encodeURIComponent(c.sender_id)}&secret=${req.query.secret}">Open chat</a></td>
+        </tr>`;
+      })
+      .join("");
+
+    res.send(`
+      <html><body style="font-family: sans-serif;">
+        <h2>Inbox (${conversations.length})</h2>
+        <p style="color:#666;">🟢 Nurse Hope active &nbsp;&nbsp; 🟡 You're handling this one</p>
+        <table border="1" cellpadding="8" style="border-collapse: collapse;">
+          <tr><th>Number</th><th>Last message</th><th>When</th><th>Reply window</th><th></th></tr>
+          ${rows}
+        </table>
+      </body></html>
+    `);
+  } catch (err) {
+    res.send("Error loading inbox: " + err.message);
+  }
+});
+
+app.get("/inbox/chat", async (req, res) => {
+  const { sender, secret } = req.query;
+  if (secret !== BROADCAST_SECRET) return res.send("Wrong password.");
+
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/conversations?sender_id=eq.${encodeURIComponent(sender)}&select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = await response.json();
+    const convo = rows?.[0];
+    if (!convo) return res.send("Conversation not found.");
+
+    const hoursAgo = Math.round((Date.now() - new Date(convo.last_message_time).getTime()) / 3600000);
+    const windowOpen = hoursAgo < 24;
+
+    const pausedUntil = convo.human_paused_until ? new Date(convo.human_paused_until).getTime() : null;
+    const isPaused = pausedUntil && pausedUntil > Date.now();
+    const pauseMinutesLeft = isPaused ? Math.round((pausedUntil - Date.now()) / 60000) : 0;
+
+    const bubbles = (convo.history || [])
+      .map((turn) => {
+        const text = turn.parts?.[0]?.text || "";
+        const isCustomer = turn.role === "user";
+        return `<div style="display:flex; justify-content:${isCustomer ? "flex-start" : "flex-end"}; margin:8px 0;">
+          <div style="max-width:70%; padding:10px 14px; border-radius:12px; background:${isCustomer ? "#f0f0f0" : "#0F5132"}; color:${isCustomer ? "#000" : "#fff"};">
+            ${text.replace(/</g, "&lt;")}
+          </div>
+        </div>`;
+      })
+      .join("");
+
+    res.send(`
+      <html><body style="font-family: sans-serif; max-width: 600px; margin: 20px auto;">
+        <a href="/inbox?secret=${secret}">&larr; Back to inbox</a>
+        <h3>${sender}</h3>
+        ${
+          isPaused
+            ? `<div style="background:#fff3cd; padding:10px; border-radius:6px; margin-bottom:10px;">
+                🟡 AI paused — you're handling this chat (resumes automatically in ~${pauseMinutesLeft} min)
+                <form method="POST" action="/inbox/resume" style="display:inline;">
+                  <input type="hidden" name="secret" value="${secret}">
+                  <input type="hidden" name="sender" value="${sender}">
+                  <button type="submit" style="margin-left:10px;">Resume AI now</button>
+                </form>
+              </div>`
+            : `<div style="background:#d1e7dd; padding:10px; border-radius:6px; margin-bottom:10px;">🟢 Nurse Hope is active on this chat</div>`
+        }
+        <div style="border:1px solid #ddd; border-radius:8px; padding:16px; max-height:500px; overflow-y:auto;">
+          ${bubbles || "<p>No messages yet.</p>"}
+        </div>
+        ${
+          windowOpen
+            ? `<form method="POST" action="/inbox/reply" style="margin-top:16px;">
+                <input type="hidden" name="secret" value="${secret}">
+                <input type="hidden" name="sender" value="${sender}">
+                <textarea name="message" rows="3" style="width:100%; padding:8px;" placeholder="Type your reply... (this pauses Nurse Hope on this chat)" required></textarea>
+                <button type="submit" style="margin-top:8px; padding:10px 20px;">Send</button>
+              </form>`
+            : `<p style="color:#999; margin-top:16px;">Reply window closed (24h+ since their last message) — use <a href="/send-message">Send Message</a> with an approved template instead.</p>`
+        }
+      </body></html>
+    `);
+  } catch (err) {
+    res.send("Error loading chat: " + err.message);
+  }
+});
+
+app.post("/inbox/reply", express.urlencoded({ extended: true }), async (req, res) => {
+  const { secret, sender, message } = req.body;
+  if (secret !== BROADCAST_SECRET) return res.send("Wrong password.");
+
+  console.log(`[INBOX REPLY] Attempting manual reply to ${sender}: ${message}`);
+
+  const HUMAN_PAUSE_MS = 2 * 60 * 60 * 1000; // 2 hours — tweak as you like
+
+  try {
+    const getRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/conversations?sender_id=eq.${encodeURIComponent(sender)}&select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = await getRes.json();
+    const convo = rows?.[0];
+    const phoneNumberId = convo?.phone_number_id || PHONE_NUMBER_ID;
+
+    const sent = await sendWhatsAppMessage(sender, message, phoneNumberId);
+
+    // Pause the AI regardless of send success — you tried to take over this
+    // conversation, so Nurse Hope should stay quiet either way. If the send
+    // failed, you'll see that below and can retry, but the pause still holds.
+    const history = convo?.history || [];
+    history.push({ role: "model", parts: [{ text: sent ? message : `[SEND FAILED — attempted]: ${message}` }] });
+    conversationCache.set(sender, {
+      history,
+      lastMessageTime: Date.now(),
+      platform: "WhatsApp",
+      phoneNumberId,
+      humanPausedUntil: Date.now() + HUMAN_PAUSE_MS,
+    });
+    await saveConversation(sender, conversationCache.get(sender));
+
+    if (!sent) {
+      return res.send(
+        `⚠️ The message may not have delivered (check Render logs for the exact error), but Nurse Hope is paused on this chat regardless — you can retry sending. <br><a href="/inbox/chat?sender=${encodeURIComponent(sender)}&secret=${secret}">Back to chat</a>`
+      );
+    }
+
+    res.redirect(`/inbox/chat?sender=${encodeURIComponent(sender)}&secret=${secret}`);
+  } catch (err) {
+    console.error("Inbox reply failed:", err);
+    res.send("Something went wrong sending your reply. Check Render logs.");
+  }
+});
+
+app.post("/inbox/resume", express.urlencoded({ extended: true }), async (req, res) => {
+  const { secret, sender } = req.body;
+  if (secret !== BROADCAST_SECRET) return res.send("Wrong password.");
+
+  try {
+    const getRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/conversations?sender_id=eq.${encodeURIComponent(sender)}&select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = await getRes.json();
+    const convo = rows?.[0];
+    if (convo) {
+      conversationCache.set(sender, {
+        history: convo.history || [],
+        lastMessageTime: Date.now(),
+        platform: convo.platform || "WhatsApp",
+        phoneNumberId: convo.phone_number_id || PHONE_NUMBER_ID,
+        humanPausedUntil: null,
+      });
+      await saveConversation(sender, conversationCache.get(sender));
+    }
+    res.redirect(`/inbox/chat?sender=${encodeURIComponent(sender)}&secret=${secret}`);
+  } catch (err) {
+    console.error("Resume AI failed:", err);
+    res.send("Something went wrong. Check Render logs.");
+  }
+});
+
+app.get("/leads", async (req, res) => {
+  if (req.query.secret !== CRM_SECRET) {
+    return res.send('<form>Password: <input type="password" name="secret"><button>View</button></form>');
+  }
+  try {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/leads?order=created_at.desc`, {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+    });
+    const leads = await response.json();
+    const rows = leads
+      .map(
+        (l) =>
+          `<tr><td>${l.created_at?.slice(0, 16)}</td><td>${l.platform}</td><td>${l.name || ""}</td><td>${l.phone || ""}</td><td>${l.email || ""}</td><td>${l.service_interest || ""}</td><td>${l.notes || ""}</td></tr>`
+      )
+      .join("");
+    res.send(`
+      <html><body style="font-family: sans-serif;">
+        <h2>Leads (${leads.length})</h2>
+        <table border="1" cellpadding="8" style="border-collapse: collapse;">
+          <tr><th>Date</th><th>Platform</th><th>Name</th><th>Phone</th><th>Email</th><th>Service</th><th>Notes</th></tr>
+          ${rows}
+        </table>
+      </body></html>
+    `);
+  } catch (err) {
+    res.send("Error loading leads: " + err.message);
+  }
+});
+
+// ====== JSON API — call this from your Lovable dashboard to send a broadcast ======
+// ====== JSON API — send a single message to one customer from your dashboard ======
+// ====== JSON API — send a free-text reply from your Lovable chat UI, pauses Nurse Hope on that chat ======
+app.post("/api/inbox-reply", async (req, res) => {
+  const { secret, sender, message } = req.body;
+
+  if (secret !== BROADCAST_SECRET) {
+    return res.status(401).json({ error: "Wrong password" });
+  }
+  if (!sender || !message) {
+    return res.status(400).json({ error: "Missing sender or message" });
+  }
+
+  console.log(`[INBOX REPLY - API] Attempting manual reply to ${sender}: ${message}`);
+  const HUMAN_PAUSE_MS = 2 * 60 * 60 * 1000;
+
+  try {
+    const getRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/conversations?sender_id=eq.${encodeURIComponent(sender)}&select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = await getRes.json();
+    const convo = rows?.[0];
+    const phoneNumberId = convo?.phone_number_id || PHONE_NUMBER_ID;
+
+    const sent = await sendWhatsAppMessage(sender, message, phoneNumberId);
+
+    const history = convo?.history || [];
+    history.push({ role: "model", parts: [{ text: sent ? message : `[SEND FAILED — attempted]: ${message}` }] });
+    conversationCache.set(sender, {
+      history,
+      lastMessageTime: Date.now(),
+      platform: "WhatsApp",
+      phoneNumberId,
+      humanPausedUntil: Date.now() + HUMAN_PAUSE_MS,
+    });
+    await saveConversation(sender, conversationCache.get(sender));
+
+    res.json({ success: sent, paused: true });
+  } catch (err) {
+    console.error("API inbox reply failed:", err);
+    res.status(500).json({ error: "Something went wrong, check Render logs" });
+  }
+});
+
+// ====== JSON API — resume Nurse Hope on a paused conversation, from Lovable ======
+app.post("/api/inbox-resume", async (req, res) => {
+  const { secret, sender } = req.body;
+
+  if (secret !== BROADCAST_SECRET) {
+    return res.status(401).json({ error: "Wrong password" });
+  }
+  if (!sender) {
+    return res.status(400).json({ error: "Missing sender" });
+  }
+
+  try {
+    const getRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/conversations?sender_id=eq.${encodeURIComponent(sender)}&select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = await getRes.json();
+    const convo = rows?.[0];
+    if (convo) {
+      conversationCache.set(sender, {
+        history: convo.history || [],
+        lastMessageTime: Date.now(),
+        platform: convo.platform || "WhatsApp",
+        phoneNumberId: convo.phone_number_id || PHONE_NUMBER_ID,
+        humanPausedUntil: null,
+      });
+      await saveConversation(sender, conversationCache.get(sender));
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error("API inbox resume failed:", err);
+    res.status(500).json({ error: "Something went wrong, check Render logs" });
+  }
+});
+
+app.post("/api/send-message", async (req, res) => {
+  const { secret, number, template, message } = req.body;
+
+  if (secret !== BROADCAST_SECRET) {
+    return res.status(401).json({ error: "Wrong password" });
+  }
+  if (!number || !template) {
+    return res.status(400).json({ error: "Missing number or template" });
+  }
+
+  const success = await sendWhatsAppTemplate(number.trim(), template, message ? [message] : [], TEMPLATE_HEADER_IMAGE || null);
+  res.json({ success });
+});
+
+app.post("/api/broadcast", async (req, res) => {
+  const { secret, template, message, numbers } = req.body;
+
+  if (secret !== BROADCAST_SECRET) {
+    return res.status(401).json({ error: "Wrong password" });
+  }
+  if (!template || !Array.isArray(numbers) || numbers.length === 0) {
+    return res.status(400).json({ error: "Missing template or numbers list" });
+  }
+
+  const results = [];
+  for (const number of numbers) {
+    const cleanNumber = number.trim();
+    let personalizedMessage = message || "";
+    if (personalizedMessage.includes("{{name}}")) {
+      const knownName = await getKnownName(cleanNumber);
+      personalizedMessage = personalizedMessage.replace(/\{\{name\}\}/gi, knownName || "there");
+    }
+    const bodyParams = personalizedMessage ? [personalizedMessage] : [];
+    const success = await sendWhatsAppTemplate(cleanNumber, template, bodyParams, TEMPLATE_HEADER_IMAGE || null);
+    results.push({ number: cleanNumber, success });
+  }
+
+  res.json({ sent: results.filter((r) => r.success).length, failed: results.filter((r) => !r.success).length, results });
+});
+
+// ====== Broadcast panel — a simple password-protected page to send to many numbers ======
+// ====== Send a single message to one specific customer (not a broadcast) ======
+app.get("/send-message", (req, res) => {
+  res.send(`
+    <html><body style="font-family: sans-serif; max-width: 500px; margin: 40px auto;">
+      <h2>Send a Message</h2>
+      <p style="color:#666;">For someone outside the 24-hour reply window, this uses an approved template (like broadcast). If they've messaged recently, plain text works too.</p>
+      <form method="POST" action="/send-message">
+        <label>Password<br><input type="password" name="secret" style="width:100%; padding:8px;" required></label><br><br>
+        <label>Their WhatsApp number<br><input type="text" name="number" style="width:100%; padding:8px;" required placeholder="2348143594483"></label><br><br>
+        <label>Template name<br><input type="text" name="template" style="width:100%; padding:8px;" required placeholder="weekly_update"></label><br><br>
+        <label>Your message<br>
+          <textarea name="message" rows="4" style="width:100%; padding:8px;" placeholder="Whatever you want to say to them..."></textarea>
+        </label><br><br>
+        <button type="submit" style="padding:10px 20px;">Send</button>
+      </form>
+    </body></html>
+  `);
+});
+
+app.post("/send-message", express.urlencoded({ extended: true }), async (req, res) => {
+  const { secret, number, template, message } = req.body;
+
+  if (secret !== BROADCAST_SECRET) {
+    return res.send("Wrong password.");
+  }
+
+  const success = await sendWhatsAppTemplate(number.trim(), template, message ? [message] : [], TEMPLATE_HEADER_IMAGE || null);
+
+  res.send(
+    success
+      ? `Sent to ${number}. <br><a href="/send-message">Send another</a>`
+      : `Failed — check Render logs for the exact error. <br><a href="/send-message">Try again</a>`
+  );
+});
+
+app.get("/broadcast-panel", (req, res) => {
+  res.send(`
+    <html><body style="font-family: sans-serif; max-width: 500px; margin: 40px auto;">
+      <h2>Send Broadcast</h2>
+      <form method="POST" action="/broadcast">
+        <label>Password<br><input type="password" name="secret" style="width:100%; padding:8px;" required></label><br><br>
+        <label>Template name (e.g. weekly_update)<br><input type="text" name="template" style="width:100%; padding:8px;" required></label><br><br>
+        <label>Your message this week (type {{name}} anywhere to personalize per recipient)<br>
+          <textarea name="message" rows="4" style="width:100%; padding:8px;" placeholder="Hi {{name}}, exciting news this week..."></textarea>
+        </label><br><br>
+        <label>Phone numbers (one per line, international format, no + or spaces)<br>
+          <textarea name="numbers" rows="8" style="width:100%; padding:8px;" required placeholder="2348143594483&#10;2348140458307"></textarea>
+        </label><br><br>
+        <button type="submit" style="padding:10px 20px;">Send Broadcast</button>
+      </form>
+    </body></html>
+  `);
+});
+
+app.post("/broadcast", express.urlencoded({ extended: true }), async (req, res) => {
+  const { secret, template, message, numbers } = req.body;
+
+  if (secret !== BROADCAST_SECRET) {
+    return res.send("Wrong password.");
+  }
+
+  const numberList = numbers.split("\n").map((n) => n.trim()).filter(Boolean);
+  const results = [];
+
+  for (const number of numberList) {
+    let personalizedMessage = message || "";
+    if (personalizedMessage.includes("{{name}}")) {
+      const knownName = await getKnownName(number);
+      personalizedMessage = personalizedMessage.replace(/\{\{name\}\}/gi, knownName || "there");
+    }
+    const bodyParams = personalizedMessage ? [personalizedMessage] : [];
+    const success = await sendWhatsAppTemplate(number, template, bodyParams, TEMPLATE_HEADER_IMAGE || null);
+    results.push(`${number}: ${success ? "sent" : "FAILED"}`);
+  }
+
+  res.send(`<pre>${results.join("\n")}</pre><br><a href="/broadcast-panel">Send another</a>`);
+});
+
+// Template parameters can't contain line breaks, tabs, or 4+ consecutive
+// spaces — WhatsApp rejects those outright. Clean automatically so every
+// caller doesn't need to remember this.
+function sanitizeTemplateParam(text) {
+  return text.replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim();
+}
+
+async function sendWhatsAppTemplate(to, templateName, bodyParams = [], headerImageUrl = null) {
+  const url = `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`;
+  const template = { name: templateName, language: { code: "en" } };
+  const components = [];
+
+  if (headerImageUrl) {
+    components.push({ type: "header", parameters: [{ type: "image", image: { link: headerImageUrl } }] });
+  }
+  if (bodyParams.length) {
+    components.push({
+      type: "body",
+      parameters: bodyParams.map((p) => ({ type: "text", text: sanitizeTemplateParam(p) })),
+    });
+  }
+  if (components.length) template.components = components;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ messaging_product: "whatsapp", to, type: "template", template }),
+  });
+  const data = await response.json();
+  if (!response.ok) console.error(`Template "${templateName}" send to ${to} failed:`, JSON.stringify(data));
+  return response.ok;
+}
+
+// ====== Alert the owner via WhatsApp when a human needs to step in ======
+// Tries a normal message first (instant, works if you've messaged the bot
+// recently); falls back to an approved template if that fails (guarantees
+// delivery even outside the 24h window). Requires a template named
+// "lead_alert" with one body variable, e.g.: "New lead alert: {{1}}"
+async function notifyOwner(summary) {
+  const sent = await sendWhatsAppMessage(OWNER_WHATSAPP_NUMBER, `🔔 Human needed:\n\n${summary}`);
+  if (!sent) {
+    console.log("Instant alert failed, falling back to template...");
+    await sendWhatsAppTemplate(OWNER_WHATSAPP_NUMBER, "lead_alert", [summary.slice(0, 1000)], TEMPLATE_HEADER_IMAGE || null);
+  }
+}
+
+// ====== Send the interactive quote-request Flow (form) to a customer ======
+async function sendQuoteFlow(to, phoneNumberId = PHONE_NUMBER_ID) {
+  const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "interactive",
+      interactive: {
+        type: "flow",
+        header: { type: "text", text: "Get a Quote" },
+        body: { text: "Fill this quick form and our team will get back to you with a full quote." },
+        footer: { text: "Nuvanta Africa" },
+        action: {
+          name: "flow",
+          parameters: {
+            flow_message_version: "3",
+            flow_id: QUOTE_FLOW_ID,
+            flow_cta: "Fill Form",
+            flow_action: "navigate",
+            flow_action_payload: { screen: "QUOTE_FORM" },
+          },
+        },
+      },
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) console.error("Failed to send Flow:", JSON.stringify(data));
+}
+
+// ====== 1. Webhook verification (Meta calls this once when you set up the webhook) ======
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("Webhook verified");
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
+});
+
+// ====== 2. Receiving incoming messages (WhatsApp, Messenger, or Instagram) ======
+app.post("/webhook", async (req, res) => {
+  res.sendStatus(200); // acknowledge immediately, Meta expects a fast response
+
+  try {
+    const platform = req.body.object; // "whatsapp_business_account" | "page" | "instagram"
+
+    if (platform === "whatsapp_business_account") {
+      await handleWhatsApp(req.body);
+    } else if (platform === "page") {
+      await handleMessenger(req.body);
+    } else if (platform === "instagram") {
+      await handleInstagram(req.body);
+    }
+  } catch (err) {
+    console.error("Error handling incoming message:", err);
+  }
+});
+
+// ====== Download an image/audio file WhatsApp sent us ======
+async function downloadWhatsAppMedia(mediaId) {
+  const metaRes = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+  });
+  const metaData = await metaRes.json();
+
+  const fileRes = await fetch(metaData.url, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+  });
+  const arrayBuffer = await fileRes.arrayBuffer();
+  const base64Data = Buffer.from(arrayBuffer).toString("base64");
+
+  return { base64Data, mimeType: metaData.mime_type };
+}
+
+// ---- WhatsApp ----
+// ====== Wait for a pause before replying (proxy for "they might still be typing") ======
+// WhatsApp/Messenger/Instagram don't expose real typing status to businesses,
+// so this waits a few seconds after each message — if more messages arrive
+// in that window, they're combined into one before the AI replies.
+const messageBuffers = new Map(); // senderId -> { texts: [], media, timer }
+const DEBOUNCE_MS = 6000;
+
 function bufferAndDebounce(senderId, text, media, onReady) {
-  let buf = buffers.get(senderId);
-  if (!buf) { buf = { texts: [], media: null }; buffers.set(senderId, buf); }
+  let buf = messageBuffers.get(senderId);
+  if (!buf) {
+    buf = { texts: [], media: null };
+    messageBuffers.set(senderId, buf);
+  }
   if (text) buf.texts.push(text);
   if (media) buf.media = media;
+
   if (buf.timer) clearTimeout(buf.timer);
   buf.timer = setTimeout(() => {
-    buffers.delete(senderId);
-    onReady(buf.texts.join("\n"), buf.media);
+    const combinedText = buf.texts.join("\n");
+    const combinedMedia = buf.media;
+    messageBuffers.delete(senderId);
+    onReady(combinedText, combinedMedia);
   }, DEBOUNCE_MS);
 }
 
-// One reply at a time per person, so two quick messages can never mix up the memory
-const chains = new Map();
-function runExclusive(id, fn) {
-  const prev = chains.get(id) || Promise.resolve();
-  const next = prev.catch(() => {}).then(fn);
-  const cleanup = () => { if (chains.get(id) === next) chains.delete(id); };
-  chains.set(id, next);
-  next.then(cleanup, cleanup);
-  return next;
-}
+async function handleWhatsApp(body) {
+  const entry = body.entry?.[0];
+  const change = entry?.changes?.[0];
+  const message = change?.value?.messages?.[0];
+  if (!message) return;
 
-const aiCalls = new Map();
-function overRateLimit(id) {
-  const now = Date.now();
-  const recent = (aiCalls.get(id) || []).filter((t) => now - t < 3600 * 1000);
-  const over = recent.length >= AI_LIMIT_PER_HOUR;
-  if (!over) recent.push(now);
-  aiCalls.set(id, recent);
-  return over;
-}
+  // Which of your numbers actually received this — always reply from THIS
+  // one, not whatever's globally set in PHONE_NUMBER_ID, so a message to
+  // your old test number doesn't get answered "from" your new number.
+  const receivingPhoneNumberId = change?.value?.metadata?.phone_number_id || PHONE_NUMBER_ID;
 
-async function answer(platform, senderId, text, media, phoneNumberId) {
-  const convo = getConversation(senderId);
-  if (convo.humanPausedUntil && convo.humanPausedUntil > Date.now()) return; // staff stepped in while we waited
-  if (overRateLimit(senderId)) { console.warn(`Rate limit reached for ${senderId}, not replying`); return; }
-
-  const raw = (await askGemini(senderId, text, platform, media, phoneNumberId)) || FALLBACK_REPLY;
-  const { text: reply, wantsBooking } = await processReply(raw, platform, senderId);
-  await sendToPlatform(platform, senderId, reply, phoneNumberId);
-  if (wantsBooking) await sendBookingForm(platform, senderId, phoneNumberId);
-}
-
-async function handleIncoming({ platform, senderId, text, media, messageId, phoneNumberId }) {
-  if (alreadySeen(messageId)) return;
-  if (BLOCKED_NUMBERS.includes(senderId)) return;
-  if (platform === "WhatsApp") markAsReadAndTyping(messageId, phoneNumberId).catch(() => {});
-
-  const convo = getConversation(senderId);
-  convo.lastCustomerTime = Date.now();
-  convo.platform = platform;
-  if (phoneNumberId) convo.phoneNumberId = phoneNumberId;
-
-  // A staff member is handling this chat: record the message but stay quiet
-  if (convo.humanPausedUntil && convo.humanPausedUntil > Date.now()) {
-    convo.history.push({ role: "user", parts: [{ text }] });
-    convo.lastMessageTime = Date.now();
-    trimHistory(convo);
+  const from = message.from;
+  if (BLOCKED_NUMBERS.includes(from)) {
+    console.log(`Ignored WhatsApp message from blocked number ${from}`);
     return;
   }
 
-  bufferAndDebounce(senderId, text, media, (combinedText, combinedMedia) => {
-    runExclusive(senderId, () => answer(platform, senderId, combinedText, combinedMedia, phoneNumberId)).catch((err) =>
-      console.error("Failed to answer message:", err)
+  let text = message.text?.body;
+  let media = null;
+
+  // Capture a submitted Flow (form) response
+  if (message.type === "interactive" && message.interactive?.type === "nfm_reply") {
+    const formData = JSON.parse(message.interactive.nfm_reply.response_json);
+    console.log(`Form submitted by ${from}:`, JSON.stringify(formData));
+    await saveLead("WhatsApp", from, {
+      name: formData.name,
+      phone: formData.phone || from,
+      service: formData.service,
+      notes: formData.details,
+    });
+    await notifyOwner(
+      `Form submitted on WhatsApp\nName: ${formData.name}\nPhone: ${formData.phone || from}\nService: ${formData.service}\nDetails: ${formData.details || "-"}`
     );
+    await sendWhatsAppMessage(from, "Thanks! We've got your details — our team will follow up shortly with your quote 🙏", receivingPhoneNumberId);
+    return;
+  }
+
+  if (message.type === "image") {
+    media = await downloadWhatsAppMedia(message.image.id);
+    text = message.image.caption || "[Customer sent an image — look at it and respond helpfully.]";
+  } else if (message.type === "audio") {
+    media = await downloadWhatsAppMedia(message.audio.id);
+    text = "[Customer sent a voice note — listen to it and respond helpfully.]";
+  }
+
+  if (!text && !media) return; // unsupported message type (video, sticker, etc.)
+
+  // Store this incoming message's raw text (before any augmentation) so it
+  // can itself be looked up later if the customer quotes it in a future message
+  if (text) messageStore.set(message.id, { text, time: Date.now() });
+
+  // If they replied/quoted an earlier message — whether it was Nurse Hope's or
+  // their own — tell the AI exactly what was quoted
+  if (message.context?.id) {
+    const quoted = messageStore.get(message.context.id);
+    if (quoted) {
+      text = `[The customer is replying directly to this earlier message: "${quoted.text}"]\n${text}`;
+    }
+  }
+
+  console.log(`WhatsApp message from ${from} (to number ${receivingPhoneNumberId}): ${text}`);
+  await markAsReadAndTyping(message.id, receivingPhoneNumberId);
+
+  // If a human is actively handling this conversation, record the message
+  // so it shows in the inbox, but don't let Nurse Hope auto-reply on top of them
+  const convo = await getConversation(from);
+  if (convo.humanPausedUntil && convo.humanPausedUntil > Date.now()) {
+    console.log(`AI paused on ${from} (human handling) — recording message only`);
+    convo.history.push({ role: "user", parts: [{ text }] });
+    convo.lastMessageTime = Date.now();
+    convo.platform = "WhatsApp";
+    convo.phoneNumberId = receivingPhoneNumberId;
+    await saveConversation(from, convo);
+    return;
+  }
+
+  bufferAndDebounce(from, text, media, async (combinedText, combinedMedia) => {
+    const aiReply = await askGemini(from, combinedText, "WhatsApp", combinedMedia, receivingPhoneNumberId);
+    const { cleanReply, shouldBookCall } = await processAIReply(aiReply, "WhatsApp", from, combinedText, receivingPhoneNumberId);
+    await sendWhatsAppMessage(from, cleanReply, receivingPhoneNumberId);
+    if (shouldBookCall) await sendQuoteFlow(from, receivingPhoneNumberId);
   });
 }
 
-// A staff member replied from the Page/Instagram inbox: pause the assistant on that chat
-function pauseForStaff(platform, customerId, text) {
-  const convo = getConversation(customerId);
-  convo.history.push({ role: "model", parts: [{ text: text || "[Staff reply]" }] });
-  convo.platform = platform;
+// ====== Download an image/audio file Messenger or Instagram sent us (direct URL, no auth needed) ======
+async function downloadMetaMedia(url) {
+  const response = await fetch(url);
+  const arrayBuffer = await response.arrayBuffer();
+  const base64Data = Buffer.from(arrayBuffer).toString("base64");
+  const mimeType = response.headers.get("content-type") || "application/octet-stream";
+  return { base64Data, mimeType };
+}
+
+// ---- Facebook Messenger ----
+async function handleMessenger(body) {
+  const entry = body.entry?.[0];
+  const messaging = entry?.messaging?.[0];
+  const senderId = messaging?.sender?.id;
+  if (!senderId) return;
+
+  // Ignore echoes of our own sent messages — Meta sends these back to us
+  // for sync purposes, they aren't new customer messages
+  if (messaging?.message?.is_echo) return;
+
+  let text = messaging?.message?.text;
+  let media = null;
+
+  const attachment = messaging?.message?.attachments?.[0];
+  if (attachment?.type === "audio") {
+    media = await downloadMetaMedia(attachment.payload.url);
+    text = "[Customer sent a voice note — listen to it and respond helpfully.]";
+  } else if (attachment?.type === "image") {
+    media = await downloadMetaMedia(attachment.payload.url);
+    text = "[Customer sent an image — look at it and respond helpfully.]";
+  }
+
+  if (!text && !media) return; // unsupported attachment type (video, file, etc.)
+
+  console.log(`Messenger message from ${senderId}: ${text}`);
+  bufferAndDebounce(senderId, text, media, async (combinedText, combinedMedia) => {
+    const aiReply = await askGemini(senderId, combinedText, "Messenger", combinedMedia);
+    const { cleanReply } = await processAIReply(aiReply, "Messenger", senderId, combinedText);
+    await sendMessengerMessage(senderId, cleanReply);
+  });
+}
+
+async function sendMessengerMessage(recipientId, text) {
+  const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      recipient: { id: recipientId },
+      message: { text },
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) console.error("Messenger send failed:", JSON.stringify(data));
+}
+
+// ---- Instagram ----
+async function handleInstagram(body) {
+  const entry = body.entry?.[0];
+  const messaging = entry?.messaging?.[0];
+  const senderId = messaging?.sender?.id;
+  if (!senderId) return;
+
+  // Ignore echoes of our own sent messages — Meta sends these back to us
+  // for sync purposes, they aren't new customer messages
+  if (messaging?.message?.is_echo) return;
+
+  let text = messaging?.message?.text;
+  let media = null;
+
+  const attachment = messaging?.message?.attachments?.[0];
+  if (attachment?.type === "audio") {
+    media = await downloadMetaMedia(attachment.payload.url);
+    text = "[Customer sent a voice note — listen to it and respond helpfully.]";
+  } else if (attachment?.type === "image") {
+    media = await downloadMetaMedia(attachment.payload.url);
+    text = "[Customer sent an image — look at it and respond helpfully.]";
+  }
+
+  if (!text && !media) return; // unsupported attachment type (video, file, etc.)
+
+  console.log(`Instagram message from ${senderId}: ${text}`);
+  bufferAndDebounce(senderId, text, media, async (combinedText, combinedMedia) => {
+    const aiReply = await askGemini(senderId, combinedText, "Instagram", combinedMedia);
+    const { cleanReply } = await processAIReply(aiReply, "Instagram", senderId, combinedText);
+    await sendInstagramMessage(senderId, cleanReply);
+  });
+}
+
+async function sendInstagramMessage(recipientId, text) {
+  const url = `https://graph.instagram.com/v21.0/${IG_ACCOUNT_ID}/messages`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${IG_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      recipient: { id: recipientId },
+      message: { text },
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) console.error("Instagram send failed:", JSON.stringify(data));
+}
+
+// ====== 3. Ask Gemini for a reply, using this customer's conversation history ======
+async function askGemini(senderId, userMessage, platform, media = null, phoneNumberId = null) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
+
+  const convo = await getConversation(senderId);
+
+  let knownNameNote = "";
+  if (convo.history.length === 0) {
+    const knownName = await getKnownName(senderId);
+    if (knownName) {
+      knownNameNote = `\n\nRETURNING CUSTOMER: This is a new session, but we've spoken with this customer before and know their name is ${knownName}. Greet them warmly by name (e.g. "Hey ${knownName}, welcome back! 👋") instead of your full generic first-time introduction, and don't ask for their name again since we already have it.`;
+    }
+  }
+
+  let paymentStatusNote = "";
+  const paymentStatus = await getPaymentStatus(senderId);
+  if (paymentStatus) {
+    if (paymentStatus.status === "pending") {
+      paymentStatusNote = `\n\nPAYMENT STATUS: This customer has a PENDING payment claim (${paymentStatus.service || "unspecified"}, ₦${paymentStatus.amount || "unspecified"}) awaiting confirmation. If they ask about it, reassure them it's being checked and they'll get their receipt automatically once confirmed — don't create a new [PAYMENT_CLAIM] tag for this same one.`;
+    } else if (paymentStatus.status === "confirmed") {
+      paymentStatusNote = `\n\nPAYMENT STATUS: This customer's most recent payment (${paymentStatus.service || "unspecified"}, ₦${paymentStatus.amount || "unspecified"}) is CONFIRMED, receipt ${paymentStatus.receipt_number} was already sent. If they ask, let them know it's confirmed and their receipt was sent — don't create a new claim.`;
+    } else if (paymentStatus.status === "send_failed") {
+      paymentStatusNote = `\n\nPAYMENT STATUS: This customer's payment was confirmed by the team, but the receipt failed to send due to a technical issue on our end — NOT their fault. If they ask, apologize briefly and say the team is resolving it and will get the receipt to them shortly. Do NOT claim a receipt was already sent.`;
+    }
+  }
+
+  const nigeriaTime = new Date().toLocaleString("en-US", {
+    timeZone: "Africa/Lagos",
+    weekday: "long",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  });
+
+  const fullContext = `${BUSINESS_CONTEXT}\n\nCURRENT PLATFORM: ${platform}\n\nCURRENT DATE/TIME IN NIGERIA: ${nigeriaTime}. Use this to greet appropriately (good morning/afternoon/evening/night) and never say something time-inappropriate like "have a great day" in the evening.${knownNameNote}${paymentStatusNote}\n\nLIVE WEBSITE CONTENT (most current info — prefer this over anything above if they conflict):\n${cachedWebsiteContent}`;
+
+  const currentParts = [{ text: userMessage }];
+  if (media) {
+    currentParts.push({ inlineData: { mimeType: media.mimeType, data: media.base64Data } });
+  }
+
+  const contents = [
+    ...convo.history,
+    { role: "user", parts: currentParts },
+  ];
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: fullContext }] },
+      contents,
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok || data.error) {
+    console.error("Gemini API error:", JSON.stringify(data.error || data));
+    return "Sorry, I'm having trouble responding right now — a team member will follow up shortly.";
+  }
+
+  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  const finalReply = reply || "Sorry, I'm having trouble responding right now — a team member will follow up shortly.";
+
+  // Save this exchange — both to the fast in-process cache and persisted to
+  // Supabase, so it survives a server restart
+  convo.history.push({ role: "user", parts: [{ text: userMessage }] });
+  convo.history.push({ role: "model", parts: [{ text: finalReply }] });
   convo.lastMessageTime = Date.now();
-  convo.humanPausedUntil = Date.now() + HUMAN_PAUSE_MS;
-  trimHistory(convo);
+  convo.platform = platform;
+  if (phoneNumberId) convo.phoneNumberId = phoneNumberId;
+  await saveConversation(senderId, convo);
+
+  return finalReply;
 }
 
-// ---- Downloading voice notes / images ----
-async function downloadWhatsAppMedia(mediaId) {
-  const meta = await (await fetch(`${GRAPH}/${mediaId}`, { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } })).json();
-  if (!meta.url) throw new Error("no media url");
-  if (meta.file_size && meta.file_size > MAX_MEDIA_BYTES) throw new Error("media too large");
-  const file = await fetch(meta.url, { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } });
-  const buf = Buffer.from(await file.arrayBuffer());
-  if (buf.length > MAX_MEDIA_BYTES) throw new Error("media too large");
-  return { base64Data: buf.toString("base64"), mimeType: meta.mime_type || "application/octet-stream" };
-}
-
-async function downloadPublicMedia(url) {
-  const res = await fetch(url);
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length > MAX_MEDIA_BYTES) throw new Error("media too large");
-  return { base64Data: buf.toString("base64"), mimeType: (res.headers.get("content-type") || "application/octet-stream").split(";")[0] };
-}
-
-// ---- WhatsApp webhook ----
-async function handleWhatsApp(body) {
-  for (const entry of body.entry || []) {
-    for (const change of entry.changes || []) {
-      const value = change.value || {};
-      const phoneNumberId = value.metadata?.phone_number_id || PHONE_NUMBER_ID;
-
-      for (const m of value.messages || []) {
-        const senderId = m.from || m.from_user_id;
-        if (!senderId) continue;
-
-        let text = null;
-        let media = null;
-        try {
-          if (m.type === "text") text = m.text?.body;
-          else if (m.type === "button") text = m.button?.text;
-          else if (m.type === "interactive") text = m.interactive?.button_reply?.title || m.interactive?.list_reply?.title;
-          else if (m.type === "image" || m.type === "audio") {
-            if (MEDIA_TO_AI) {
-              media = await downloadWhatsAppMedia(m[m.type].id);
-              text = m.type === "image"
-                ? m.image.caption || "[The patient sent an image. Do not interpret medical images or results.]"
-                : "[The patient sent a voice note. Listen to it and respond helpfully.]";
-            } else text = MEDIA_PLACEHOLDER;
-          } else if (m.type === "video" || m.type === "document") text = MEDIA_PLACEHOLDER;
-        } catch (err) {
-          console.error("Could not fetch media:", err.message);
-          text = MEDIA_PLACEHOLDER;
-        }
-        if (!text) continue;
-
-        if (m.type === "text") messageStore.set(m.id, { text, time: Date.now() });
-        if (m.context?.id) {
-          const quoted = messageStore.get(m.context.id);
-          if (quoted) text = `[The patient is replying to this earlier message: "${quoted.text}"]\n${text}`;
-        }
-        await handleIncoming({ platform: "WhatsApp", senderId, text, media, messageId: m.id, phoneNumberId });
-      }
-    }
-  }
-}
-
-// ---- Facebook Messenger and Instagram (same payload shape) ----
-async function handleMessaging(body, platform) {
-  for (const entry of body.entry || []) {
-    for (const ev of entry.messaging || []) {
-      const msg = ev.message;
-      if (!msg) continue; // read receipts, postbacks and reactions are ignored
-
-      if (msg.is_echo) {
-        // A message sent from our own side. If it was not sent by this app, a human did, so pause the assistant.
-        const appId = msg.app_id ? String(msg.app_id) : "";
-        if (META_APP_ID && appId !== META_APP_ID && ev.recipient?.id) pauseForStaff(platform, ev.recipient.id, msg.text);
-        continue;
-      }
-
-      const senderId = ev.sender?.id;
-      if (!senderId || (platform === "Instagram" && senderId === IG_ACCOUNT_ID)) continue;
-
-      let text = msg.text;
-      let media = null;
-      const attachment = msg.attachments?.[0];
-      if (!text && attachment) {
-        try {
-          if (MEDIA_TO_AI && (attachment.type === "audio" || attachment.type === "image") && attachment.payload?.url) {
-            media = await downloadPublicMedia(attachment.payload.url);
-            text = attachment.type === "audio"
-              ? "[The patient sent a voice note. Listen to it and respond helpfully.]"
-              : "[The patient sent an image. Do not interpret medical images or results.]";
-          } else text = MEDIA_PLACEHOLDER;
-        } catch (err) {
-          console.error("Could not fetch attachment:", err.message);
-          text = MEDIA_PLACEHOLDER;
-        }
-      }
-      if (!text) continue;
-      await handleIncoming({ platform, senderId, text, media, messageId: msg.mid });
-    }
-  }
-}
-
-// =====================================================================================
-// 12. THE WEB SERVER
-// =====================================================================================
-const app = express();
-// Keep the raw body so Meta's signature can be checked
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
-app.use(express.urlencoded({ extended: true }));
-
-app.get("/", (req, res) => res.send("Triple H messaging assistant is running."));
-
-// ---- Meta webhook ----
-app.get("/webhook", (req, res) => {
-  if (req.query["hub.mode"] === "subscribe" && req.query["hub.verify_token"] === env.VERIFY_TOKEN) {
-    return res.status(200).send(req.query["hub.challenge"]);
-  }
-  res.sendStatus(403);
-});
-
-function validSignature(req) {
-  const header = req.headers["x-hub-signature-256"] || "";
-  if (!header.startsWith("sha256=") || !req.rawBody) return false;
-  const secrets = [env.APP_SECRET, env.IG_APP_SECRET].filter(Boolean);
-  return secrets.some((secret) => {
-    const expected = "sha256=" + crypto.createHmac("sha256", secret).update(req.rawBody).digest("hex");
-    return expected.length === header.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(header));
-  });
-}
-
-app.post("/webhook", (req, res) => {
-  if (!validSignature(req)) {
-    console.error("Rejected a webhook call with an invalid signature");
-    return res.sendStatus(401);
-  }
-  res.sendStatus(200); // answer fast, Meta expects it
-  (async () => {
-    try {
-      const object = req.body.object;
-      if (object === "whatsapp_business_account") await handleWhatsApp(req.body);
-      else if (object === "page") await handleMessaging(req.body, "Messenger");
-      else if (object === "instagram") await handleMessaging(req.body, "Instagram");
-    } catch (err) {
-      console.error("Error handling webhook:", err);
-    }
-  })();
-});
-
-// ---- Web booking form (Messenger / Instagram) ----
-function bookingPage({ platform, sender, token, error = "", v = {} }) {
-  const opts = (list, selected) =>
-    `<option value="">Choose...</option>` + list.map((o) => `<option value="${esc(o.id)}"${selected === o.id ? " selected" : ""}>${esc(o.title)}</option>`).join("");
-  const radios = MODES.map((o, i) =>
-    `<label class="r"><input type="radio" name="mode" value="${esc(o.id)}"${v.mode === o.id || (!v.mode && i === 0) ? " checked" : ""}> ${esc(o.title)}</label>`).join("");
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Book a Consultation | Triple H Fertility Hub</title>
-<style>
-body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f4f7f5;margin:0;color:#1d2b24}
-.card{max-width:480px;margin:0 auto;background:#fff;min-height:100vh;padding:24px 20px 40px}
-h1{font-size:1.3rem;margin:0 0 4px;color:#0F5132}p.sub{margin:0 0 18px;color:#55645c;font-size:.92rem}
-label{display:block;font-weight:600;font-size:.9rem;margin:14px 0 6px}label.r{font-weight:400;margin:6px 0}
-input[type=text],input[type=tel],input[type=email],select,textarea{width:100%;box-sizing:border-box;padding:12px;border:1px solid #c9d4ce;border-radius:8px;font-size:1rem;background:#fff}
-.err{background:#fdecea;color:#8a1c12;padding:10px 12px;border-radius:8px;margin-bottom:12px;font-size:.9rem}
-.c{display:flex;gap:10px;align-items:flex-start;font-weight:400;margin-top:18px}.c input{margin-top:4px}
-button{margin-top:22px;width:100%;padding:14px;background:#0F5132;color:#fff;border:0;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer}
-small{color:#6a786f;display:block;margin-top:6px}
-</style></head><body><div class="card">
-<h1>Book a Consultation</h1>
-<p class="sub">Triple H Fertility Hub. Clinic hours: Mon-Thu 9am-6pm, Sat 10am-4pm. Our team will confirm your exact time.</p>
-${error ? `<div class="err">${esc(error)}</div>` : ""}
-<form method="POST" action="/book-session">
-<input type="hidden" name="p" value="${esc(platform)}"><input type="hidden" name="s" value="${esc(sender)}"><input type="hidden" name="t" value="${esc(token)}">
-<label for="name">Full name</label><input id="name" type="text" name="name" maxlength="80" required value="${esc(v.name)}">
-<label for="phone">Phone / WhatsApp</label><input id="phone" type="tel" name="phone" maxlength="30" required value="${esc(v.phone)}">
-<label for="email">Email (optional)</label><input id="email" type="email" name="email" maxlength="100" value="${esc(v.email)}">
-<label for="service">Service</label><select id="service" name="service" required>${opts(SERVICES, v.service)}</select>
-<label>Consultation type</label>${radios}
-<label for="day">Preferred day</label><select id="day" name="day" required>${opts(DAYS, v.day)}</select>
-<label for="time">Preferred time</label><select id="time" name="time" required>${opts(TIMES, v.time)}</select>
-<label for="notes">Anything to add?</label><textarea id="notes" name="notes" rows="3" maxlength="300">${esc(v.notes)}</textarea>
-<small>Please do not share medical records here.</small>
-<label class="c"><input type="checkbox" name="consent" required> <span>I agree that Triple H Fertility Hub may contact me about this request.</span></label>
-<button type="submit">Request appointment</button>
-</form></div></body></html>`;
-}
-
-const WEB_FORM_PLATFORMS = ["WhatsApp", "Messenger", "Instagram"];
-
-app.get("/book-session", (req, res) => {
-  const { p, s, t } = req.query;
-  res.set("Cache-Control", "no-store");
-  if (!WEB_FORM_PLATFORMS.includes(p) || !validLink(p, String(s || ""), String(t || ""))) {
-    return res.status(403).send("This booking link is not valid. Please message us again to get a new one.");
-  }
-  // On WhatsApp we already know the number, so pre-fill it
-  const v = p === "WhatsApp" && /^\d{5,16}$/.test(String(s)) ? { phone: String(s) } : {};
-  res.send(bookingPage({ platform: p, sender: String(s), token: String(t), v }));
-});
-
-app.post("/book-session", async (req, res) => {
-  const { p, s, t } = req.body || {};
-  res.set("Cache-Control", "no-store");
-  if (!WEB_FORM_PLATFORMS.includes(p) || !validLink(p, String(s || ""), String(t || ""))) {
-    return res.status(403).send("This booking link is not valid. Please message us again to get a new one.");
-  }
-  const form = normalizeSubmission({ ...req.body, consent: req.body.consent });
-  const raw = req.body;
-  const problem =
-    !form.name ? "Please enter your name." :
-    !form.phone && !form.email ? "Please enter a phone number or email." :
-    !raw.service || !form.service ? "Please choose a service." :
-    !raw.day || !raw.time ? "Please choose a preferred day and time." :
-    !form.consent ? "Please tick the box so we can contact you." : "";
-  if (problem) return res.status(400).send(bookingPage({ platform: p, sender: String(s), token: String(t), error: problem, v: raw }));
-
+// ====== 3.5 Show blue ticks + typing indicator while we prepare a reply ======
+async function markAsReadAndTyping(messageId, phoneNumberId = PHONE_NUMBER_ID) {
+  const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
   try {
-    await recordBooking(p, String(s), raw);
+    await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        status: "read",
+        message_id: messageId,
+        typing_indicator: { type: "text" },
+      }),
+    });
   } catch (err) {
-    console.error("Web booking failed:", err);
-    return res.status(500).send(bookingPage({ platform: p, sender: String(s), token: String(t), error: "Something went wrong. Please try again, or call +234 201 350 2083.", v: raw }));
+    console.error("Failed to mark as read / show typing:", err);
   }
-  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Thank you</title></head>
-<body style="font-family:system-ui,sans-serif;text-align:center;margin:0;padding:60px 20px;color:#1d2b24">
-<h2 style="color:#0F5132">Thank you, ${esc(form.name.split(" ")[0])}!</h2>
-<p>We have your request. Our team will contact you shortly to confirm your appointment.<br>You can close this page and return to the chat.</p></body></html>`);
-});
-
-// =====================================================================================
-// 13. STAFF PAGES (password protected): inbox, takeover, leads
-// =====================================================================================
-function adminAuth(req, res, next) {
-  const header = req.headers.authorization || "";
-  if (header.startsWith("Basic ")) {
-    const decoded = Buffer.from(header.slice(6), "base64").toString();
-    const i = decoded.indexOf(":");
-    if (i > -1 && safeEqual(decoded.slice(0, i), ADMIN_USER) && safeEqual(decoded.slice(i + 1), env.ADMIN_PASSWORD)) return next();
-  }
-  res.set("WWW-Authenticate", 'Basic realm="Triple H staff"').status(401).send("Authentication required");
 }
 
-// Blocks forms posted from other websites
-function sameOrigin(req, res, next) {
-  const origin = req.headers.origin;
-  if (!origin) return next();
-  try { if (new URL(origin).host === req.headers.host) return next(); } catch (err) { /* fall through */ }
-  res.status(403).send("Blocked: cross-site request");
-}
+// ====== 4. Send reply back via WhatsApp Cloud API ======
+// ====== Track every message (both directions) so we can identify what's being quoted/replied to ======
+const messageStore = new Map(); // WhatsApp message ID -> { text, time }
 
-const ago = (ts) => {
-  const mins = Math.max(0, Math.round((Date.now() - ts) / 60000));
-  return mins < 60 ? `${mins}m ago` : mins < 2880 ? `${Math.round(mins / 60)}h ago` : `${Math.round(mins / 1440)}d ago`;
-};
-const windowOpen = (ts) => Boolean(ts) && Date.now() - ts < 24 * 3600 * 1000;
-
-function page(title, body) {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
-<style>body{font-family:system-ui,sans-serif;max-width:960px;margin:20px auto;padding:0 12px;color:#222}
-table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top;font-size:14px}
-th{background:#f5f5f5}a{color:#0F5132}.muted{color:#777}.bubble{max-width:75%;padding:10px 14px;border-radius:12px;margin:6px 0;white-space:pre-wrap}
-.cust{background:#f0f0f0}.bot{background:#0F5132;color:#fff;margin-left:auto}button{padding:8px 16px;cursor:pointer}</style></head>
-<body><nav><a href="/inbox">Inbox</a> &nbsp;|&nbsp; <a href="/leads">Leads</a></nav>${body}</body></html>`;
-}
-
-app.get("/inbox", adminAuth, (req, res) => {
-  const rows = [...conversations.entries()].sort((a, b) => b[1].lastMessageTime - a[1].lastMessageTime).slice(0, 60);
-  const tr = rows.map(([id, c]) => {
-    const last = c.history[c.history.length - 1]?.parts?.[0]?.text || "";
-    const paused = c.humanPausedUntil && c.humanPausedUntil > Date.now();
-    return `<tr><td>${esc(c.platform)}</td><td>${esc(id)}</td><td>${esc(last.slice(0, 90))}</td><td>${ago(c.lastMessageTime)}</td>
-      <td>${paused ? "Staff handling" : "Assistant active"}</td><td>${windowOpen(c.lastCustomerTime) ? "Open" : "Closed"}</td>
-      <td><a href="/inbox/chat?sender=${encodeURIComponent(id)}">Open</a></td></tr>`;
-  }).join("");
-  res.send(page("Inbox", `<h2>Inbox (${rows.length})</h2><p class="muted">Recent chats since the last server restart.</p>
-    <table><tr><th>Channel</th><th>Contact</th><th>Last message</th><th>When</th><th>Status</th><th>Reply window</th><th></th></tr>${tr}</table>`));
-});
-
-app.get("/inbox/chat", adminAuth, (req, res) => {
-  const sender = String(req.query.sender || "");
-  const c = conversations.get(sender);
-  if (!c) return res.status(404).send(page("Not found", "<p>Conversation not found (it may have expired or the server restarted).</p>"));
-  const paused = c.humanPausedUntil && c.humanPausedUntil > Date.now();
-  const bubbles = c.history.map((t) => `<div class="bubble ${t.role === "user" ? "cust" : "bot"}">${esc(t.parts?.[0]?.text)}</div>`).join("");
-  const banner = paused
-    ? `<p>Staff are handling this chat. The assistant is paused until ${esc(new Date(c.humanPausedUntil).toLocaleString("en-GB", { timeZone: "Africa/Lagos" }))}.
-       <form method="POST" action="/inbox/resume" style="display:inline"><input type="hidden" name="sender" value="${esc(sender)}"><button>Resume assistant now</button></form></p>`
-    : `<p class="muted">The assistant is active on this chat. Sending a reply pauses it.</p>`;
-  const form = windowOpen(c.lastCustomerTime)
-    ? `<form method="POST" action="/inbox/reply"><input type="hidden" name="sender" value="${esc(sender)}">
-       <textarea name="message" rows="3" style="width:100%" required></textarea><br><button>Send reply</button></form>`
-    : `<p class="muted">The 24-hour reply window is closed. Please call the patient or ask them to message again.</p>`;
-  res.send(page("Chat", `<h3>${esc(c.platform)}: ${esc(sender)}</h3>${banner}<div>${bubbles || "<p>No messages.</p>"}</div>${form}`));
-});
-
-app.post("/inbox/reply", adminAuth, sameOrigin, async (req, res) => {
-  try {
-    const sender = String(req.body.sender || "");
-    const message = String(req.body.message || "").trim();
-    const c = conversations.get(sender);
-    if (!c || !message) return res.status(400).send("Missing chat or message");
-    const sent = await sendToPlatform(c.platform, sender, message, c.phoneNumberId);
-    c.history.push({ role: "model", parts: [{ text: sent ? message : `[SEND FAILED] ${message}` }] });
-    c.lastMessageTime = Date.now();
-    c.humanPausedUntil = Date.now() + HUMAN_PAUSE_MS; // pause even if the send failed, so the assistant does not talk over staff
-    trimHistory(c);
-    res.redirect(`/inbox/chat?sender=${encodeURIComponent(sender)}`);
-  } catch (err) {
-    console.error("Inbox reply failed:", err);
-    res.status(500).send("Something went wrong. Check the Render logs.");
-  }
-});
-
-app.post("/inbox/resume", adminAuth, sameOrigin, (req, res) => {
-  const sender = String(req.body.sender || "");
-  const c = conversations.get(sender);
-  if (c) c.humanPausedUntil = null;
-  res.redirect(`/inbox/chat?sender=${encodeURIComponent(sender)}`);
-});
-
-app.get("/leads", adminAuth, (req, res) => {
-  const tr = leads.map((l) => `<tr><td>${esc(l.created.slice(0, 16).replace("T", " "))}</td><td>${esc(l.type)}</td><td>${esc(l.platform)}</td>
-    <td>${esc(l.name)}</td><td>${esc(l.phone || l.email || (l.platform === "WhatsApp" ? l.senderId : ""))}</td><td>${esc(l.service)}</td><td>${esc(l.mode)}</td>
-    <td>${esc([l.day, l.time].filter(Boolean).join(", "))}</td><td>${esc(l.notes)}</td><td>${esc(l.status)}</td>
-    <td>${l.status === "contacted" ? "" : `<form method="POST" action="/leads/contacted"><input type="hidden" name="id" value="${l.id}"><button>Mark contacted</button></form>`}</td></tr>`).join("");
-  res.send(page("Leads", `<h2>Leads and appointment requests (${leads.length})</h2>
-    <p class="muted">${googleCreds ? "Every booking is also saved to your Google Sheet, which is the permanent record." : "Google Sheets is not connected, so this list is cleared when the server restarts."}</p>
-    <table><tr><th>Date</th><th>Type</th><th>Channel</th><th>Name</th><th>Contact</th><th>Service</th><th>Consultation</th><th>Preferred</th><th>Notes</th><th>Status</th><th></th></tr>${tr}</table>`));
-});
-
-app.post("/leads/contacted", adminAuth, sameOrigin, (req, res) => {
-  const lead = leads.find((l) => l.id === Number(req.body.id));
-  if (lead) lead.status = "contacted";
-  res.redirect("/leads");
-});
-
-// =====================================================================================
-// 14. HOUSEKEEPING AND START
-// =====================================================================================
 setInterval(() => {
   const now = Date.now();
-  for (const [id, c] of conversations) if (now - c.lastMessageTime > SESSION_TIMEOUT_MS) conversations.delete(id);
-  for (const [id, t] of seen) if (now - t > 3600 * 1000) seen.delete(id);
-  for (const [id, m] of messageStore) if (now - m.time > 24 * 3600 * 1000) messageStore.delete(id);
-  for (const [id, arr] of aiCalls) if (!arr.some((t) => now - t < 3600 * 1000)) aiCalls.delete(id);
-}, 3600 * 1000).unref();
+  for (const [id, entry] of messageStore) {
+    if (now - entry.time > 24 * 60 * 60 * 1000) messageStore.delete(id);
+  }
+}, 60 * 60 * 1000);
 
-process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
+async function sendWhatsAppMessage(to, text, phoneNumberId = PHONE_NUMBER_ID) {
+  const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
 
-refreshWebsiteContent();
-setInterval(refreshWebsiteContent, 6 * 3600 * 1000).unref();
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text },
+    }),
+  });
 
-const PORT = env.PORT || 3000;
-app.listen(PORT, () => console.log(`Triple H assistant running on port ${PORT}`));
+  const data = await response.json();
+  if (!response.ok) {
+    console.error("WhatsApp send failed:", JSON.stringify(data));
+    return false;
+  }
+
+  const sentId = data.messages?.[0]?.id;
+  if (sentId) messageStore.set(sentId, { text, time: Date.now() });
+
+  console.log(`Reply sent to ${to}`);
+  return true;
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+const axios = require('axios');
+
+const GRAPH_API_URL = `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
+const AUTH_HEADER = {
+  headers: {
+    Authorization: `Bearer ${process.env.PERMANENT_TOKEN}`,
+    'Content-Type': 'application/json'
+  }
+};
+
+/**
+ * Sends a rich interactive booking banner with logo and action buttons
+ */
+async function sendBookingInvitation(to) {
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      header: {
+        type: "image",
+        image: {
+          // Direct public URL to Triple H clinic logo or banner
+          link: "https://triplehfertilityhub.com/favicon.png"
+        }
+      },
+      body: {
+        text: 
+          "*Triple H Fertility Hub & Specialist Hospital*\n" +
+          "_Care, Compassion & Clinical Excellence_\n\n" +
+          "To book your consultation with *Dr. Haleemah Olalere* and our fertility team:\n\n" +
+          "📋 *Registration/Card:* ₦10,000\n" +
+          "🩺 *Consultation:* ₦70,000\n" +
+          "🕒 *Hours:* Mon–Thu 9am–6pm | Sat 10am–4pm\n" +
+          "📍 *Location:* No. 5 Onitolo Street, Gbaja, Surulere"
+      },
+      footer: {
+        text: "Select an option below to proceed"
+      },
+      action: {
+        buttons: [
+          {
+            type: "reply",
+            reply: {
+              id: "btn_book_chat",
+              title: "Book Here in Chat 📝"
+            }
+          },
+          {
+            type: "reply",
+            reply: {
+              id: "btn_book_online",
+              title: "Open Booking Form 🌐"
+            }
+          }
+        ]
+      }
+    }
+  };
+
+  try {
+    await axios.post(GRAPH_API_URL, payload, AUTH_HEADER);
+  } catch (error) {
+    console.error("Error sending booking invitation:", error.response?.data || error.message);
+  }
+}
+async function sendFormLink(to) {
+  const textPayload = {
+    messaging_product: "whatsapp",
+    to: to,
+    type: "text",
+    text: {
+      preview_url: true,
+      body: "Please complete your booking details directly on our mobile portal:\n👉 https://triplehfertilityhub.com/book\n\nOnce completed, our coordinator will receive your details immediately!"
+    }
+  };
+  await axios.post(GRAPH_API_URL, textPayload, AUTH_HEADER);
+}
+async function sendServicePicker(to) {
+  const payload = {
+    messaging_product: "whatsapp",
+    to: to,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      header: {
+        type: "text",
+        text: "Select a Consultation Service"
+      },
+      body: {
+        text: "Choose the service you wish to schedule an appointment for:"
+      },
+      footer: {
+        text: "Triple H Care Services"
+      },
+      action: {
+        button: "Choose Service",
+        sections: [
+          {
+            title: "Consultations",
+            rows: [
+              { id: "svc_ivf", title: "IVF & Fertility Care", description: "Comprehensive reproductive assessment" },
+              { id: "svc_gynae", title: "Gynaecology Care", description: "Fibroids, PCOS, pelvic health" },
+              { id: "svc_telemedicine", title: "Telemedicine (Online)", description: "Virtual consultation via video/call" },
+              { id: "svc_scan", title: "Pelvic Ultrasound Scan", description: "Follicular tracking & pelvic imaging" }
+            ]
+          }
+        ]
+      }
+    }
+  };
+  await axios.post(GRAPH_API_URL, payload, AUTH_HEADER);
+}
