@@ -38,6 +38,26 @@ const OWNER_PHONE_NUMBERS = [
   "234YYYYYYYYYY", // Owner 2
 ];
 
+// >>> PUT YOUR TWO REAL OWNER NUMBERS HERE (or set OWNER_PHONE_NUMBERS on Render as "234xxxxxxxxxx,234yyyyyyyyyy").
+// Placeholders (with X/Y) are ignored automatically so they can't cause errors.
+// OWNER_WHATSAPP_NUMBER above is always included too, so nobody is missed.
+const ACTIVE_OWNER_NUMBERS = [
+  ...new Set(
+    [
+      ...(process.env.OWNER_PHONE_NUMBERS ? process.env.OWNER_PHONE_NUMBERS.split(",") : []),
+      ...OWNER_PHONE_NUMBERS,
+      OWNER_WHATSAPP_NUMBER,
+    ]
+      .map((n) => String(n || "").replace(/\D/g, ""))
+      .filter((n) => /^\d{10,15}$/.test(n))
+  ),
+];
+console.log(`Owner alert numbers loaded: ${ACTIVE_OWNER_NUMBERS.length}`);
+
+// ====== Never let one error crash the whole bot (this is what stops "typing but no reply") ======
+process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection (kept running):", reason));
+process.on("uncaughtException", (err) => console.error("Uncaught exception (kept running):", err));
+
 const BASE_URL = process.env.BASE_URL || "https://meta-n4tt.onrender.com";
 // If any of your approved templates have an IMAGE header, put a public image
 // URL here (e.g. your logo on your website). Leave as-is if none need one.
@@ -194,7 +214,12 @@ async function sendPatientSummaryToOwners(summaryData) {
     return;
   }
 
-  for (const ownerPhone of OWNER_PHONE_NUMBERS) {
+  const clean = (v, fallback, max = 900) => {
+    const t = sanitizeTemplateParam(String(v || fallback)).slice(0, max);
+    return t || fallback;
+  };
+
+  for (const ownerPhone of ACTIVE_OWNER_NUMBERS) {
     try {
       const payload = {
         messaging_product: "whatsapp",
@@ -208,31 +233,30 @@ async function sendPatientSummaryToOwners(summaryData) {
             {
               type: "body",
               parameters: [
-                { type: "text", text: name || "Prospective Patient" },
-                { type: "text", text: phone || "Not provided" },
-                { type: "text", text: service || "General Fertility Inquiry" },
-                { type: "text", text: status || "Inquiry / Needs Follow-up" },
-                { type: "text", text: notes || "Chat ended without explicit booking." }
+                { type: "text", text: clean(name, "Prospective Patient", 100) },
+                { type: "text", text: clean(phone, "Not provided", 50) },
+                { type: "text", text: clean(service, "General Fertility Inquiry", 150) },
+                { type: "text", text: clean(status, "Inquiry / Needs Follow-up", 100) },
+                { type: "text", text: clean(notes, "Chat ended without explicit booking.") }
               ]
             }
           ]
         }
       };
 
-      const response = await axios.post(
-        `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
-        payload,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json"
-          }
-        }
-      );
-
-      console.log(`Summary template sent to owner ${ownerPhone}:`, response.data);
+      const response = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) console.error(`Failed to send summary template to ${ownerPhone}:`, JSON.stringify(data));
+      else console.log(`Summary template sent to owner ${ownerPhone}:`, JSON.stringify(data));
     } catch (err) {
-      console.error(`Failed to send summary template to ${ownerPhone}:`, err.response?.data || err.message);
+      console.error(`Failed to send summary template to ${ownerPhone}:`, err.message);
     }
   }
 }
@@ -410,7 +434,7 @@ async function getKnownName(senderId) {
     return null;
   }
 }
-async function saveLead(platform, senderId, leadData) {
+async function saveLeadToGoogleSheet(platform, senderId, leadData) {
   try {
     const payload = {
       name: leadData.name || "WhatsApp Patient",
@@ -440,6 +464,8 @@ async function saveLead(platform, senderId, leadData) {
 }
 
 async function saveLead(platform, senderId, leadData) {
+  // Log to the Google Sheet too (this was being skipped before because of the duplicate name)
+  saveLeadToGoogleSheet(platform, senderId, leadData).catch((e) => console.error("[Google Sheet] error:", e.message));
   try {
     const response = await fetch(`${SUPABASE_URL}/rest/v1/leads`, {
       method: "POST",
@@ -1376,10 +1402,13 @@ async function sendWhatsAppTemplate(to, templateName, bodyParams = [], headerIma
 // delivery even outside the 24h window). Requires a template named
 // "lead_alert" with one body variable, e.g.: "New lead alert: {{1}}"
 async function notifyOwner(summary) {
-  const sent = await sendWhatsAppMessage(OWNER_WHATSAPP_NUMBER, `🔔 Human needed:\n\n${summary}`);
-  if (!sent) {
-    console.log("Instant alert failed, falling back to template...");
-    await sendWhatsAppTemplate(OWNER_WHATSAPP_NUMBER, "lead_alert", [summary.slice(0, 1000)], TEMPLATE_HEADER_IMAGE || null);
+  // Alert every owner number (both owners), not just one
+  for (const ownerNumber of ACTIVE_OWNER_NUMBERS) {
+    const sent = await sendWhatsAppMessage(ownerNumber, `🔔 Human needed:\n\n${summary}`);
+    if (!sent) {
+      console.log(`Instant alert to ${ownerNumber} failed, falling back to template...`);
+      await sendWhatsAppTemplate(ownerNumber, "lead_alert", [summary.slice(0, 1000)], TEMPLATE_HEADER_IMAGE || null);
+    }
   }
 }
 
@@ -1450,74 +1479,71 @@ app.post("/webhook", async (req, res) => {
     console.error("Error handling incoming message:", err);
   }
 
-  // Inside your incoming WhatsApp message handler, right after receiving a message from `senderId`:
-
-// Clear any existing timer for this patient
-if (conversationTimers.has(senderId)) {
-  clearTimeout(conversationTimers.get(senderId));
-}
-
-// Start a new 5-minute inactivity countdown (300,000 ms)
-const timer = setTimeout(async () => {
-  conversationTimers.delete(senderId);
-
-  try {
-    console.log(`Patient ${senderId} inactive for 5 minutes. Generating summary...`);
-    
-    // Retrieve conversation history for this sender
-    const history = getConversationHistory(senderId); // your existing history lookup
-    
-    if (!history || history.length < 2) return; // Don't alert on empty or single-message chats
-
-    // Generate quick summary using your OpenAI / LLM call
-    const summaryCompletion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `You are an assistant summarizing a clinical fertility chat for clinic managers.
-Return a valid JSON object only with these exact keys:
-{
-  "name": "patient's name or Prospective Patient",
-  "service": "primary topic or service discussed",
-  "status": "Inquiry / Asked Fees / Wants Appointment / Booked",
-  "notes": "2-sentence summary of what was discussed and what follow-up is needed"
-}`
-        },
-        {
-          role: "user",
-          content: `Conversation:\n${history.map(m => `${m.role}: ${m.content}`).join("\n")}`
-        }
-      ],
-      response_format: { type: "json_object" }
-    });
-
-    const parsed = JSON.parse(summaryCompletion.choices[0].message.content);
-
-    // 1. Send template alert to owners on WhatsApp
-    await sendPatientSummaryToOwners({
-      name: parsed.name,
-      phone: senderId,
-      service: parsed.service,
-      status: parsed.status,
-      notes: parsed.notes
-    });
-
-    // 2. Also log to your Google Sheet webhook
-    await saveLead("WhatsApp Chat", senderId, {
-      fullName: parsed.name,
-      phone: senderId,
-      service: parsed.service,
-      notes: parsed.notes
-    });
-
-  } catch (err) {
-    console.error("Error in inactivity summary task:", err);
-  }
-}, 5 * 60 * 1000); // 5 minutes
-
-conversationTimers.set(senderId, timer);
 });
+
+// ====== 5-minute inactivity summary -> sent to BOTH owners (template: patient_chat_summary) ======
+// Moved here from inside the /webhook route (where `senderId` did not exist and crashed the bot).
+// Uses Gemini + your existing conversation history instead of OpenAI.
+function startInactivitySummaryTimer(senderId) {
+  if (conversationTimers.has(senderId)) clearTimeout(conversationTimers.get(senderId));
+
+  const timer = setTimeout(async () => {
+    conversationTimers.delete(senderId);
+    try {
+      console.log(`Patient ${senderId} inactive for 5 minutes. Generating summary...`);
+      const convo = await getConversation(senderId);
+      const history = convo?.history || [];
+      if (history.length < 2) return; // don't alert on empty or single-message chats
+
+      const transcript = history
+        .map((m) => `${m.role === "model" ? "Nurse Hope" : "Patient"}: ${(m.parts || []).map((p) => p.text || "").join(" ")}`)
+        .join("\n")
+        .slice(-12000);
+
+      const instruction =
+        "You are summarizing a fertility clinic chat for clinic managers. Return ONLY a valid JSON object with exactly these keys: " +
+        '{"name": "patient\'s name or Prospective Patient", "service": "primary topic or service discussed", ' +
+        '"status": "Inquiry / Asked Fees / Wants Appointment / Booked", ' +
+        '"notes": "2-sentence plain-text summary of what was discussed and what follow-up is needed"}\n\nConversation:\n' + transcript;
+
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: instruction }] }],
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+      });
+      const data = await response.json();
+      let raw = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+      raw = raw.replace(/```json|```/g, "").trim();
+      let parsed = {};
+      try { parsed = JSON.parse(raw); } catch { parsed = { notes: raw.slice(0, 300) }; }
+
+      // 1. Template alert to both owners on WhatsApp
+      await sendPatientSummaryToOwners({
+        name: parsed.name,
+        phone: senderId,
+        service: parsed.service,
+        status: parsed.status,
+        notes: parsed.notes,
+      });
+
+      // 2. Log to Google Sheet + Supabase
+      await saveLead("WhatsApp Chat", senderId, {
+        name: parsed.name,
+        phone: senderId,
+        service: parsed.service,
+        notes: parsed.notes,
+      });
+    } catch (err) {
+      console.error("Error in inactivity summary task:", err);
+    }
+  }, 5 * 60 * 1000);
+
+  conversationTimers.set(senderId, timer);
+}
 
 // ====== Download an image/audio file WhatsApp sent us ======
 async function downloadWhatsAppMedia(mediaId) {
@@ -1557,7 +1583,7 @@ function bufferAndDebounce(senderId, text, media, onReady) {
     const combinedText = buf.texts.join("\n");
     const combinedMedia = buf.media;
     messageBuffers.delete(senderId);
-    onReady(combinedText, combinedMedia);
+    Promise.resolve(onReady(combinedText, combinedMedia)).catch((err) => console.error("Reply handler error:", err));
   }, DEBOUNCE_MS);
 }
 
@@ -1622,6 +1648,7 @@ async function handleWhatsApp(body) {
   }
 
   console.log(`WhatsApp message from ${from} (to number ${receivingPhoneNumberId}): ${text}`);
+  startInactivitySummaryTimer(from);
   await markAsReadAndTyping(message.id, receivingPhoneNumberId);
 
   // If a human is actively handling this conversation, record the message
@@ -1638,10 +1665,14 @@ async function handleWhatsApp(body) {
   }
 
   bufferAndDebounce(from, text, media, async (combinedText, combinedMedia) => {
-    const aiReply = await askGemini(from, combinedText, "WhatsApp", combinedMedia, receivingPhoneNumberId);
-    const { cleanReply, shouldBookCall } = await processAIReply(aiReply, "WhatsApp", from, combinedText, receivingPhoneNumberId);
-    await sendWhatsAppMessage(from, cleanReply, receivingPhoneNumberId);
-    if (shouldBookCall) await sendQuoteFlow(from, receivingPhoneNumberId);
+    try {
+      const aiReply = await askGemini(from, combinedText, "WhatsApp", combinedMedia, receivingPhoneNumberId);
+      const { cleanReply, shouldBookCall } = await processAIReply(aiReply, "WhatsApp", from, combinedText, receivingPhoneNumberId);
+      await sendWhatsAppMessage(from, cleanReply, receivingPhoneNumberId);
+      if (shouldBookCall) await sendQuoteFlow(from, receivingPhoneNumberId);
+    } catch (err) {
+      console.error(`WhatsApp reply failed for ${from}:`, err);
+    }
   });
 }
 
@@ -1894,7 +1925,20 @@ async function sendWhatsAppMessage(to, text, phoneNumberId = PHONE_NUMBER_ID) {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-const axios = require('axios');
+let axios;
+try {
+  axios = require('axios');
+} catch (e) {
+  // axios isn't installed: small fetch-based stand-in so the booking helpers below still work
+  axios = {
+    post: async (url, body, cfg = {}) => {
+      const r = await fetch(url, { method: "POST", headers: cfg.headers || {}, body: JSON.stringify(body) });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) { const err = new Error(`HTTP ${r.status}`); err.response = { data }; throw err; }
+      return { data };
+    },
+  };
+}
 
 const GRAPH_API_URL = `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
 const AUTH_HEADER = {
