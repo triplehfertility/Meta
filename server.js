@@ -362,7 +362,7 @@ DATE RULES (STRICT):
 - NEVER ask a vague question like "Thursday or Friday?". Always give real dates and the hours.
 - After they pick a date, ask for a time within that day's opening hours.
 - If they ask for a date that is a Friday or Sunday, kindly explain we are closed and offer the nearest open dates from the list.
-- In the SAVE_LEAD tag, write "date" as YYYY-MM-DD exactly as shown in the list above.`;
+- In the SAVE_LEAD tag, write "date" as YYYY-MM-DD exactly as shown in the list above, and "time" as 24-hour HH:MM (for example 14:30).`;
 }
 
 /**
@@ -523,8 +523,8 @@ When a patient expresses interest in booking an appointment, seeing a doctor, or
    - Registration / Card: ₦10,000 ($8)
    - Doctor Consultation: ₦70,000 ($47)
    - Bank: Providus Bank, Account: 1305084494 (Triple H Fertility Hub)
-5. The moment you have their Name, Service, and Preferred Date/Time, output this exact hidden tag in your response (date must be YYYY-MM-DD):
-   [SAVE_LEAD:{"name":"Patient Name","phone":"","email":"","service":"IVF","mode":"In-Person","date":"2026-11-26","time":"10:00 AM","notes":"Patient notes or symptoms"}]
+5. The moment you have their Name, Service, and Preferred Date/Time, output this exact hidden tag in your response (date must be YYYY-MM-DD and time must be 24-hour HH:MM, for example 14:30):
+   [SAVE_LEAD:{"name":"Patient Name","phone":"","email":"","service":"IVF","mode":"In-person (Surulere)","date":"2026-11-26","time":"10:00","notes":"Patient notes or symptoms"}]
 6. Reassure them that their appointment request has been logged and the Triple H admin team will reach out directly to confirm the exact slot and verify payment.
 
 BANK ACCOUNTS FOR PAYMENT
@@ -579,7 +579,7 @@ TECHNICAL NOTE - PAYMENT CLAIMS
 
 TECHNICAL NOTE - SAVING LEAD INFO
 - Include this tag when a patient shares their name or details (update it again if they change their date or time):
-  [SAVE_LEAD:{"name":"their name","phone":"their number or empty string","email":"their email or empty string","service":"service of interest","mode":"In-Person or Telemedicine","date":"YYYY-MM-DD or empty","time":"preferred time or empty","notes":"symptoms or other details"}]
+  [SAVE_LEAD:{"name":"their name","phone":"their number or empty string","email":"their email or empty string","service":"service of interest","mode":"In-person (Surulere) or Telemedicine","date":"YYYY-MM-DD or empty","time":"24-hour HH:MM or empty","notes":"symptoms or other details"}]
 `;
 
 async function getKnownName(senderId) {
@@ -599,6 +599,7 @@ async function saveLeadToGoogleSheet(platform, senderId, leadData) {
       time: leadData.time || "",
       source: `${platform || "WhatsApp"} Bot`,
       notes: leadData.notes || "",
+      key: process.env.BOOKING_KEY || undefined, // only needed if the Apps Script requires the key
     };
 
     console.log(`[Google Sheet] Logging lead for ${senderId}:`, payload);
@@ -1595,7 +1596,7 @@ function startInactivitySummaryTimer(senderId) {
         "You are summarizing a fertility clinic chat for clinic managers. Return ONLY a valid JSON object with exactly these keys: " +
         '{"name": "patient\'s name or Prospective Patient", "service": "primary topic or service discussed", ' +
         '"mode": "In-Person or Telemedicine or empty", "date": "preferred appointment date as YYYY-MM-DD or empty", ' +
-        '"time": "preferred appointment time or empty", ' +
+        '"time": "preferred appointment time as 24-hour HH:MM or empty", ' +
         '"status": "Inquiry / Asked Fees / Wants Appointment / Booked", ' +
         '"notes": "2-sentence plain-text summary of what was discussed and what follow-up is needed"}\n\nConversation:\n' + transcript;
 
@@ -1631,17 +1632,27 @@ function startInactivitySummaryTimer(senderId) {
       const when = [final.date, final.time].filter(Boolean).join(" ");
       const ownerNotes = `${final.notes}${when ? ` Preferred slot: ${when}${final.mode ? " (" + final.mode + ")" : ""}.` : ""}`;
 
-      // 1. Template alert to both owners on WhatsApp
-      await sendPatientSummaryToOwners({
-        name: final.name,
-        phone: senderId,
-        service: final.service,
-        status: final.status,
-        notes: ownerNotes,
-      });
+      // Only real booking leads go to the Sheet (which emails and alerts the owners).
+      // Casual chats (directions, prices, jobs) just get the WhatsApp summary below.
+      const isBooking =
+        !!(draft.name && (draft.date || draft.time || draft.service)) ||
+        /wants appointment|booked/i.test(String(final.status || ""));
 
-      // 2. One clean row in Google Sheet (+ email alert via Apps Script) and the in-memory leads list
-      await saveLead("WhatsApp", senderId, final);
+      // 1. WhatsApp summary to the owners. Set SKIP_SERVER_SUMMARY_WHEN_LOGGED=true on Render to skip it
+      //    for bookings, if the Sheet script already sends its own WhatsApp alert for them.
+      const skipSummary = isBooking && process.env.SKIP_SERVER_SUMMARY_WHEN_LOGGED === "true";
+      if (!skipSummary) {
+        await sendPatientSummaryToOwners({
+          name: final.name,
+          phone: senderId,
+          service: final.service,
+          status: final.status,
+          notes: ownerNotes,
+        });
+      }
+
+      // 2. One clean row in the Google Sheet (booking leads only) and the in-memory leads list
+      await saveLead("WhatsApp", senderId, final, { logToSheet: isBooking });
 
       leadDrafts.delete(senderId); // so the same chat is not logged twice
     } catch (err) {
