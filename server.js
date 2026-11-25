@@ -20,14 +20,172 @@ const BROADCAST_SECRET = process.env.BROADCAST_SECRET || "PASTE_A_PASSWORD_HERE"
 // ====== WHATSAPP FLOW (in-chat form) ======
 const QUOTE_FLOW_ID = process.env.QUOTE_FLOW_ID || "PASTE_YOUR_FLOW_ID_HERE";
 
-// ====== IN-MEMORY STORAGE (no database) ======
-// Everything below lives in the server's memory. The Google Sheet is the permanent record of leads.
-// If Render restarts the server, chat memory and open payment claims reset (see CONFIRM <phone> <amount>).
+// ====== PERSISTENT MEMORY ======
+// Chats, patient profiles (name etc.) and payment claims are kept in memory for speed AND saved
+// to storage so a Render restart or redeploy forgets nothing.
+// Backend is chosen automatically:
+//   1. Supabase  -> if SUPABASE_URL and SUPABASE_KEY are set (one table: bot_state, see README below)
+//   2. File      -> if DATA_DIR is set (needs a Render persistent disk mounted at that path)
+//   3. Memory    -> otherwise (forgets on restart)
+// If storage ever fails, the bot keeps working from memory and logs the error. It never crashes.
+const fs = require("fs");
+const path = require("path");
+
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_KEY = process.env.SUPABASE_KEY || ""; // use the SERVICE ROLE key, server side only
+const DATA_DIR = process.env.DATA_DIR || "";
+const STATE_BACKEND = SUPABASE_URL && SUPABASE_KEY ? "supabase" : DATA_DIR ? "file" : "memory";
+console.log(`State storage backend: ${STATE_BACKEND}`);
+
+const store = (() => {
+  const sbHeaders = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" };
+  const filePath = DATA_DIR ? path.join(DATA_DIR, "state.json") : "";
+  let fileState = {};
+  let fileTimer = null;
+
+  function flushFile() {
+    if (fileTimer) { clearTimeout(fileTimer); fileTimer = null; }
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      const tmp = filePath + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(fileState));
+      fs.renameSync(tmp, filePath);
+    } catch (err) {
+      console.error("State file write failed:", err.message);
+    }
+  }
+
+  return {
+    async loadAll() {
+      try {
+        if (STATE_BACKEND === "supabase") {
+          const out = [];
+          const pageSize = 500;
+          for (let offset = 0; offset < 20000; offset += pageSize) {
+            const r = await fetch(
+              `${SUPABASE_URL}/rest/v1/bot_state?select=key,value&order=updated_at.desc&limit=${pageSize}&offset=${offset}`,
+              { headers: sbHeaders }
+            );
+            const rows = await r.json();
+            if (!Array.isArray(rows)) {
+              console.error("State load error (is the bot_state table created?):", JSON.stringify(rows));
+              break;
+            }
+            out.push(...rows);
+            if (rows.length < pageSize) break;
+          }
+          return out;
+        }
+        if (STATE_BACKEND === "file" && fs.existsSync(filePath)) {
+          fileState = JSON.parse(fs.readFileSync(filePath, "utf8") || "{}");
+          return Object.entries(fileState).map(([key, value]) => ({ key, value }));
+        }
+      } catch (err) {
+        console.error("State load failed (starting empty):", err.message);
+      }
+      return [];
+    },
+    async save(key, value) {
+      try {
+        if (STATE_BACKEND === "supabase") {
+          const r = await fetch(`${SUPABASE_URL}/rest/v1/bot_state`, {
+            method: "POST",
+            headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates,return=minimal" },
+            body: JSON.stringify({ key, value, updated_at: new Date().toISOString() }),
+          });
+          if (!r.ok) console.error("State save failed:", await r.text());
+        } else if (STATE_BACKEND === "file") {
+          fileState[key] = value;
+          if (!fileTimer) fileTimer = setTimeout(flushFile, 2000);
+        }
+      } catch (err) {
+        console.error("State save failed:", err.message);
+      }
+    },
+    flushFileNow() { if (STATE_BACKEND === "file") flushFile(); },
+  };
+})();
+
+// Writes are slightly delayed and merged so a fast back-and-forth doesn't hammer the database.
+const pendingWrites = new Map(); // key -> { timer, valueFn }
+function persistLater(key, valueFn, delay = 1500) {
+  const existing = pendingWrites.get(key);
+  if (existing) clearTimeout(existing.timer);
+  const timer = setTimeout(() => {
+    pendingWrites.delete(key);
+    store.save(key, valueFn());
+  }, delay);
+  pendingWrites.set(key, { timer, valueFn });
+}
+async function flushPendingWrites() {
+  const entries = [...pendingWrites.entries()];
+  pendingWrites.clear();
+  for (const [key, { timer, valueFn }] of entries) {
+    clearTimeout(timer);
+    await store.save(key, valueFn());
+  }
+  store.flushFileNow();
+}
+// Render sends SIGTERM on every redeploy/restart: save anything still waiting first.
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received, saving state before shutdown...");
+  await flushPendingWrites();
+  process.exit(0);
+});
+
 const CRM_SECRET = process.env.CRM_SECRET || "PASTE_A_PASSWORD_HERE"; // for the /leads page
-const recentLeads = []; // newest first, max 200
-const knownNames = new Map(); // senderId -> patient name
+const recentLeads = []; // newest first, max 200 (the Google Sheet is the permanent record)
 const payments = new Map(); // claim id -> payment claim
 let nextPaymentId = 1;
+
+// ====== PATIENT PROFILES: remembered FOREVER (chat history expires, the person is not forgotten) ======
+// Holds name, WhatsApp display name, last service/mode, first and last seen.
+const profiles = new Map(); // senderId -> { name, waName, service, mode, firstSeen, lastSeen }
+function setProfile(senderId, patch) {
+  const id = String(senderId);
+  const placeholder = /^(patient name|their name|prospective patient|whatsapp patient|customer|patient|unknown)$/i;
+  const existing = profiles.get(id);
+  const p = existing || { firstSeen: new Date().toISOString() };
+  let changed = !existing;
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (v === undefined || v === null) continue;
+    const val = String(v).trim();
+    if (!val) continue;
+    if (k === "name" && placeholder.test(val)) continue;
+    if (p[k] !== val) { p[k] = val; changed = true; }
+  }
+  const now = Date.now();
+  if (!p.lastSeen || now - new Date(p.lastSeen).getTime() > 10 * 60 * 1000) {
+    p.lastSeen = new Date(now).toISOString();
+    changed = true;
+  }
+  profiles.set(id, p);
+  if (changed) persistLater(`profile:${id}`, () => profiles.get(id), 1000);
+}
+function persistPayment(p) {
+  payments.set(p.id, p);
+  persistLater(`pay:${p.id}`, () => payments.get(p.id), 500);
+}
+
+// Loaded once at startup. Incoming webhooks wait for this (see /webhook).
+async function loadPersistedState() {
+  const rows = await store.loadAll();
+  let convs = 0, profs = 0, pays = 0;
+  const now = Date.now();
+  for (const { key, value } of rows) {
+    if (!value) continue;
+    if (key.startsWith("conv:")) {
+      if (now - (value.lastMessageTime || 0) < SESSION_TIMEOUT_MS) { conversationCache.set(key.slice(5), value); convs++; }
+    } else if (key.startsWith("profile:")) {
+      profiles.set(key.slice(8), value); profs++;
+    } else if (key.startsWith("pay:")) {
+      payments.set(Number(key.slice(4)), value);
+      nextPaymentId = Math.max(nextPaymentId, Number(value.id) + 1);
+      pays++;
+    }
+  }
+  console.log(`Restored from storage: ${convs} chats, ${profs} patient profiles, ${pays} payment claims`);
+}
 
 // ====== ALERT YOU WHEN A HUMAN NEEDS TO STEP IN ======
 const OWNER_WHATSAPP_NUMBER = process.env.OWNER_WHATSAPP_NUMBER || "2348143594483";
@@ -80,7 +238,7 @@ const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || "PASTE_YOUR_INSTAGRAM_ACC
 const IG_ACCOUNT_ID = process.env.IG_ACCOUNT_ID || "PASTE_YOUR_INSTAGRAM_ACCOUNT_ID_HERE";
 
 // ====== CONVERSATION MEMORY (per customer, kept in server memory) ======
-const SESSION_TIMEOUT_MS = Number(process.env.SESSION_TIMEOUT_HOURS || 48) * 60 * 60 * 1000;
+const SESSION_TIMEOUT_MS = Number(process.env.SESSION_TIMEOUT_HOURS || 720) * 60 * 60 * 1000;
 const conversationCache = new Map();
 
 async function getConversation(senderId) {
@@ -95,6 +253,7 @@ async function getConversation(senderId) {
 
 async function saveConversation(senderId, convo) {
   conversationCache.set(senderId, convo);
+  persistLater(`conv:${senderId}`, () => conversationCache.get(senderId) || convo);
 }
 
 setInterval(() => {
@@ -424,7 +583,7 @@ TECHNICAL NOTE - SAVING LEAD INFO
 `;
 
 async function getKnownName(senderId) {
-  return knownNames.get(String(senderId)) || null;
+  return profiles.get(String(senderId))?.name || null;
 }
 
 async function saveLeadToGoogleSheet(platform, senderId, leadData) {
@@ -466,7 +625,7 @@ async function saveLead(platform, senderId, leadData, { logToSheet = true } = {}
     saveLeadToGoogleSheet(platform, senderId, leadData).catch((e) => console.error("[Google Sheet] error:", e.message));
   }
   const name = leadData.name && !/^prospective patient$/i.test(String(leadData.name)) ? String(leadData.name) : null;
-  if (name) knownNames.set(String(senderId), name);
+  setProfile(senderId, { name, service: leadData.service, mode: leadData.mode });
 
   const extra = [leadData.mode, leadData.date, leadData.time].filter(Boolean).join(" ");
   recentLeads.unshift({
@@ -531,6 +690,7 @@ async function processAIReply(aiReply, platform, senderId, userMessage, phoneNum
         if (v !== undefined && v !== null && String(v).trim() !== "") merged[k] = v;
       }
       leadDrafts.set(senderId, merged);
+      setProfile(senderId, { name: merged.name, service: merged.service, mode: merged.mode });
       console.log(`Lead draft updated for ${senderId}:`, JSON.stringify(merged));
     } catch (err) {
       console.error("Failed to parse SAVE_LEAD tag:", err);
@@ -544,7 +704,7 @@ async function processAIReply(aiReply, platform, senderId, userMessage, phoneNum
       const claimData = JSON.parse(paymentClaimMatch[1]);
       const claimId = await savePaymentClaim(platform, senderId, claimData, phoneNumberId);
       await notifyOwner(
-        `Payment claim #${claimId ?? "?"} (${platform})\nCustomer: ${senderId}\nName: ${claimData.name || "-"}\nService: ${claimData.service || "-"}\nAmount claimed: ${claimData.amount || "-"}\n\nCheck your bank, then reply here:\nCONFIRM ${claimId ?? "ID"}\n(or CONFIRM ${senderId} 80000 to set the amount, this also works after a server restart)\nREJECT ${claimId ?? "ID"}\n\nWeb page: ${BASE_URL}/pending-payments`
+        `Payment claim #${claimId ?? "?"} (${platform})\nCustomer: ${senderId}\nName: ${claimData.name || "-"}\nService: ${claimData.service || "-"}\nAmount claimed: ${claimData.amount || "-"}\n\nCheck your bank, then reply here:\nCONFIRM ${claimId ?? "ID"}\n(or CONFIRM ${senderId} 80000 to set the amount, this also works after a server restart)\nREJECT ${claimId ?? "ID"}`
       );
     } catch (err) {
       console.error("Failed to parse PAYMENT_CLAIM tag:", err);
@@ -747,6 +907,7 @@ async function savePaymentClaim(platform, senderId, claimData, phoneNumberId = P
     receipt_number: null,
     created_at: new Date().toISOString(),
   });
+  persistPayment(payments.get(id));
   return id;
 }
 
@@ -829,7 +990,7 @@ async function processPaymentConfirmation(payment) {
     payment.status = "send_failed";
     payment.notes = `${payment.notes || ""} [Receipt generation/send failed, retry manually]`.trim();
   }
-  payments.set(payment.id, payment);
+  persistPayment(payment);
 
   return { sent, receiptNumber };
 }
@@ -916,7 +1077,7 @@ async function handleOwnerCommand(from, text, phoneNumberId) {
         sender_id: refDigits,
         phone: refDigits,
         phone_number_id: phoneNumberId,
-        customer_name: knownNames.get(refDigits) || "Patient",
+        customer_name: profiles.get(refDigits)?.name || "Patient",
         service: "Consultation / Registration",
         amount: null,
         notes: "Confirmed directly by owner",
@@ -924,7 +1085,7 @@ async function handleOwnerCommand(from, text, phoneNumberId) {
         receipt_number: null,
         created_at: new Date().toISOString(),
       };
-      payments.set(id, payment);
+      persistPayment(payment);
     }
 
     if (!payment) {
@@ -942,6 +1103,7 @@ async function handleOwnerCommand(from, text, phoneNumberId) {
 
     if (command === "reject") {
       payment.status = "rejected";
+      persistPayment(payment);
       await reply(`Claim #${payment.id} (${payment.customer_name || payment.phone || payment.sender_id}) marked as rejected. Nothing was sent to the patient.`);
       return true;
     }
@@ -1393,6 +1555,7 @@ app.get("/webhook", (req, res) => {
 // ====== 2. Receiving incoming messages (WhatsApp, Messenger, or Instagram) ======
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
+  await stateReady; // make sure saved chats and profiles are loaded first
 
   try {
     const platform = req.body.object;
@@ -1537,6 +1700,9 @@ async function handleWhatsApp(body) {
   const receivingPhoneNumberId = change?.value?.metadata?.phone_number_id || PHONE_NUMBER_ID;
 
   const from = message.from;
+  // WhatsApp tells us the person's profile name on every message: remember it for personalization
+  const waName = change?.value?.contacts?.[0]?.profile?.name;
+  setProfile(from, waName ? { waName } : {});
   if (BLOCKED_NUMBERS.includes(from)) {
     console.log(`Ignored WhatsApp message from blocked number ${from}`);
     return;
@@ -1719,12 +1885,21 @@ async function askGemini(senderId, userMessage, platform, media = null, phoneNum
 
   const convo = await getConversation(senderId);
 
+  const profile = profiles.get(String(senderId)) || {};
   let knownNameNote = "";
-  if (convo.history.length === 0) {
-    const knownName = await getKnownName(senderId);
-    if (knownName) {
-      knownNameNote = `\n\nRETURNING CUSTOMER: This is a new session, but we've spoken with this customer before and know their name is ${knownName}. Greet them warmly by name (e.g. "Hello ${knownName}, welcome back! 👋") instead of your full generic first-time introduction, and don't ask for their name again since we already have it.`;
+  if (profile.name) {
+    const lastVisit = profile.lastSeen
+      ? new Date(profile.lastSeen).toLocaleDateString("en-GB", { timeZone: "Africa/Lagos", day: "numeric", month: "long", year: "numeric" })
+      : "";
+    const details = [profile.service ? `last interest: ${profile.service}` : "", profile.mode ? `preferred mode: ${profile.mode}` : ""]
+      .filter(Boolean)
+      .join(", ");
+    knownNameNote = `\n\nKNOWN PATIENT: Their name is ${profile.name}${details ? " (" + details + ")" : ""}. Never ask for their name again. Use their first name naturally now and then. Do not volunteer sensitive medical details unprompted; refer to their earlier interest only in general, gentle terms.`;
+    if (convo.history.length === 0) {
+      knownNameNote += ` This is a new session but they have spoken with us before${lastVisit ? " (last on " + lastVisit + ")" : ""}. Greet them warmly by name, e.g. "Hello ${profile.name}, welcome back! 👋", instead of your full first-time introduction.`;
     }
+  } else if (profile.waName) {
+    knownNameNote = `\n\nWHATSAPP DISPLAY NAME: ${profile.waName}. This is their WhatsApp profile name and may be a nickname or business name. You may greet them with it, but confirm how they would like to be addressed if it looks like a nickname.`;
   }
 
   let paymentStatusNote = "";
@@ -1749,8 +1924,11 @@ async function askGemini(senderId, userMessage, platform, media = null, phoneNum
     currentParts.push({ inlineData: { mimeType: media.mimeType, data: media.base64Data } });
   }
 
+  // Only the last 40 turns go to Gemini (long chats get slow and costly). Must start with a user turn.
+  const recentHistory = convo.history.slice(-40);
+  while (recentHistory.length && recentHistory[0].role !== "user") recentHistory.shift();
   const contents = [
-    ...convo.history,
+    ...recentHistory,
     { role: "user", parts: currentParts },
   ];
 
@@ -1846,6 +2024,7 @@ async function sendWhatsAppMessage(to, text, phoneNumberId = PHONE_NUMBER_ID) {
   return true;
 }
 
+const stateReady = loadPersistedState().catch((err) => console.error("State restore failed:", err.message));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
